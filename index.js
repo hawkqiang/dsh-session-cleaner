@@ -3,6 +3,7 @@ import fs from 'node:fs/promises';
 import {createHash,randomUUID} from 'node:crypto';
 import bridge from './bridge.cjs';
 import core from './core.cjs';
+import host from './host.cjs';
 
 export const inject=['workspaceRegistry','sessionPersistence','connection'];
 export function apply(ctx){
@@ -20,16 +21,8 @@ export function apply(ctx){
     if(failed||disposed||!planDir||!guard)throw Error('插件尚未就绪，请重开 DSH');
     if(!archived(sessionId))throw Error('该会话未归档，已拒绝删除');
     const snapshots=await ctx.sessionPersistence.list();
-    const target=snapshots.find(x=>x.header?.id===sessionId);
-    if(!target||target.location?.kind!=='jsonl')throw Error('找不到受支持的 JSONL 会话');
-    const file=target.location.path,root=path.dirname(path.dirname(path.dirname(file)));
-    if(snapshots.some(s=>s.location?.kind!=='jsonl'||typeof s.location?.path!=='string'||path.dirname(path.dirname(path.dirname(s.location.path)))!==root))throw Error('无法验证统一的存储边界');
     const at=revision;
-    const plan=await core.preparePlan({root,sessionId,archived:true,snapshots,planDir,archiveStateFile:guard});
-    if(disposed||failed||at!==revision||!archived(sessionId))throw Error('归档状态已变化，请重试');
-    const done=await core.executePlan({root,planDir,planId:plan.planId,sessionId,liveConfirmed:true});
-    try{await fs.stat(file);throw Error('删除后日志仍然存在')}catch(e){if(e.code!=='ENOENT')throw e}
-    return {bytes:done.bytes,title:typeof target.header?.title==='string'?target.header.title:undefined};
+    return host.removePlannedSession({sessionId,snapshots,planDir,guard,core,stillValid:()=>!disposed&&!failed&&at===revision&&archived(sessionId)});
   }
 
   // Same-origin page route: the browser reaches it through DSH's authenticated API

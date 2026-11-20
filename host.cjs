@@ -62,21 +62,37 @@ async function removeOne({sessionId, snapshots, planDir, guard, core, allowTree}
   return {bytes: Number(done.bytes) || 0};
 }
 
+// A conversation the user just closed can hold its write handle for a moment, so a
+// transient busy refusal is retried instead of failing the whole removal.
+const TRANSIENT = /被 DSH 占用|正被其他程序打开|still active|being used by another process|sharing violation/i;
+const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
+
 /**
  * Delete one session, and with `withChildren` its whole descendant tree.
  * Children go first so no surviving log keeps a parent link to a removed one.
  * @param options - sessionId, provider snapshots, plan directory, epoch file, core,
- *   `list` to re-read snapshots between deletions, `stillValid` to reject staleness.
+ *   `list` to re-read snapshots between deletions, `stillValid` to reject staleness,
+ *   and `attempts` for a transient busy writer.
  */
-async function removeTree({sessionId, snapshots, planDir, guard, core, withChildren, list, stillValid}) {
+async function removeTree({sessionId, snapshots, planDir, guard, core, withChildren, list, stillValid, attempts = 3}) {
   const members = descendantsOf(snapshots, sessionId);
   if (members.length > 0 && withChildren !== true) throw Error(`该会话有 ${members.length} 个子会话，需要同时删除才能移除`);
   const ids = [...members.map(s => s.header.id), sessionId];
   let total = 0;
   for (const id of ids) {
     if (typeof stillValid === 'function' && !stillValid()) throw Error('归档状态已变化，请重试');
-    const current = typeof list === 'function' ? await list() : snapshots;
-    const result = await removeOne({sessionId: id, snapshots: current, planDir, guard, core, allowTree: members.length > 0});
+    let result;
+    for (let attempt = 1; ; attempt += 1) {
+      if (typeof stillValid === 'function' && !stillValid()) throw Error('归档状态已变化，请重试');
+      const current = typeof list === 'function' ? await list() : snapshots;
+      try {
+        result = await removeOne({sessionId: id, snapshots: current, planDir, guard, core, allowTree: members.length > 0});
+        break;
+      } catch (error) {
+        if (attempt >= attempts || !TRANSIENT.test(String(error?.message ?? error))) throw error;
+        await delay(400 * attempt);
+      }
+    }
     total += result.bytes;
   }
   const root = snapshots.find(s => s?.header?.id === sessionId);

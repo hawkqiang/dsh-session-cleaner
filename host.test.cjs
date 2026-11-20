@@ -29,6 +29,22 @@ test('host path deletes a leaf session and reports its size', async t=>{
  await assert.rejects(fs.stat(a.snapshots[0].location.path),{code:'ENOENT'});
 });
 
+test('host path retries a transient busy writer and gives up on a persistent one', async t=>{
+ const a=await fixture(t);
+ const busy=()=>{throw Error('该会话仍被 DSH 占用：先切换到其他对话让它关闭后再试')};
+ const flaky={...core,executePlan:(opts)=>{if(retries++<2)busy();return core.executePlan(opts);}};
+ let retries=0;
+ const result=await removeTree({...a,core:flaky});
+ assert.equal(result.deleted,1);
+ assert.equal(retries,3,'two transient refusals then a successful third attempt');
+ await assert.rejects(fs.stat(a.snapshots[0].location.path),{code:'ENOENT'});
+
+ const b=await fixture(t);
+ const alwaysBusy={...core,executePlan:busy};
+ await assert.rejects(removeTree({...b,core:alwaysBusy,attempts:2}),/被 DSH 占用/);
+ assert.equal(await fs.readFile(b.snapshots[0].location.path,'utf8'),'synthetic-log');
+});
+
 test('host path refuses a parent until the caller opts into the tree', async t=>{
  const a=await fixture(t,{withChild:true});
  await assert.rejects(removeTree(a),/子会话/);
@@ -58,7 +74,8 @@ test('host path refuses a stale archive state observed before deletion', async t
 
 test('host path refuses a log rewritten after planning', async t=>{
  const a=await fixture(t);
- await assert.rejects(removeTree({...a,stillValid:()=>{fsSync.appendFileSync(a.snapshots[0].location.path,'x');return true;}}),/changed/);
+ let rewrites=0;
+ await assert.rejects(removeTree({...a,stillValid:()=>{if(rewrites++===0)fsSync.appendFileSync(a.snapshots[0].location.path,'x');return true;}}),/changed/);
  assert.equal(await fs.readFile(a.snapshots[0].location.path,'utf8'),'synthetic-logx');
 });
 

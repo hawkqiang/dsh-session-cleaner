@@ -26,7 +26,7 @@ test('native diagnostics become an actionable reason',()=>{
   assert.match(script,/CLEANER_ERR/);
   assert.equal((script.match(/\{/g)||[]).length,(script.match(/\}/g)||[]).length,'balanced braces');
  }
- assert.match(explain('Exception calling "Remove"\nDSH writer is still active'),/写入句柄/);
+ assert.match(explain('Exception calling "Remove"\nDSH writer is still active'),/被 DSH 占用/);
  assert.match(explain('IOException: The process cannot access the file because it is being used by another process.'),/正被其他程序打开/);
  assert.match(explain('Reparse directory refused'),/符号链接/);
  assert.match(explain('Log content changed'),/内容已变化/);

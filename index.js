@@ -8,7 +8,7 @@ import host from './host.cjs';
 export const inject=['workspaceRegistry','sessionPersistence','connection'];
 // Bump together with package.json. The startup line in host.log proves which
 // Host code the running DSH actually loaded.
-const VERSION='1.3.2';
+const VERSION='1.3.3';
 export function apply(ctx){
   if(process.platform!=='win32')return;
   let stop,disposed=false,revision=0,guard,failed=false,planDir,logFile;

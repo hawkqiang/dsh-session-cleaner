@@ -128,7 +128,7 @@ const nativeLive=composeNative(false);
 // Translate the native check's own diagnostics into a reason the page can show,
 // so a refusal explains itself instead of guessing.
 const NATIVE_HINTS=[
- [/DSH writer is still active/, '该会话仍有 DSH 写入句柄，请关闭这个对话再试'],
+ [/DSH writer is still active/, '该会话仍被 DSH 占用：先切换到其他对话让它关闭后再试，或完全退出 DSH 后用「清理助手.cmd」删除'],
  [/being used by another process|sharing violation/i, '日志正被其他程序打开，请关闭该对话或稍后重试'],
  [/Reparse directory refused/, '路径经过符号链接或联接点，已拒绝删除'],
  [/A local fixed NTFS volume is required/, '需要本机固定的 NTFS 卷'],

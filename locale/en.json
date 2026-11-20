@@ -1,1 +1,1 @@
-{"meta":{"title":"Session cleaner","description":"Preview and permanently delete one archived session log while DSH stays open. The assistant re-verifies the target and holds the same writer lock DSH uses. No bulk deletion."}}
+{"meta":{"title":"Session cleaner","description":"Delete one archived session log from its sidebar row. The Host holds the same writer lock DSH uses, refuses when a writer is active or the log changed, then refreshes the session list."}}

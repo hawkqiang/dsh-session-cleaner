@@ -17,3 +17,19 @@ test('native handle primitive: synthetic exclusive delete, busy lease, altered b
  const neighbor=path.join(a.base,'keep');await fs.writeFile(neighbor,'preserve');await new Promise((resolve,reject)=>{const p=require('node:child_process').spawn(path.join(process.env.SystemRoot,'System32','WindowsPowerShell','v1.0','powershell.exe'),['-NoProfile','-NonInteractive','-EncodedCommand',Buffer.from(code,'utf16le').toString('base64')],{stdio:'inherit',env:{...process.env,DSH_TEST_SYNTHETIC_FILE:a.f}});p.once('error',reject);p.once('exit',c=>c===0?resolve():reject(Error('Synthetic native primitive test failed: '+c)))});await assert.rejects(fs.stat(a.f),{code:'ENOENT'});assert.equal(await fs.readFile(neighbor,'utf8'),'preserve');
 });
 test('reject hard-linked log',async t=>{const a=await fixture(t);await fs.link(a.f,path.join(a.base,'alias'));await assert.rejects(preparePlan(a),/single-link/)});
+test('native diagnostics become an actionable reason',()=>{
+ const {explain,composeNative}=require('./core.cjs');
+ assert.match(composeNative(true),/Get-CimInstance Win32_Process/);
+ assert.doesNotMatch(composeNative(false),/Get-CimInstance/);
+ for(const script of [composeNative(true),composeNative(false)]){
+  assert.match(script,/try \{/);
+  assert.match(script,/CLEANER_ERR/);
+  assert.equal((script.match(/\{/g)||[]).length,(script.match(/\}/g)||[]).length,'balanced braces');
+ }
+ assert.match(explain('Exception calling "Remove"\nDSH writer is still active'),/写入句柄/);
+ assert.match(explain('IOException: The process cannot access the file because it is being used by another process.'),/正被其他程序打开/);
+ assert.match(explain('Reparse directory refused'),/符号链接/);
+ assert.match(explain('Log content changed'),/内容已变化/);
+ assert.match(explain('some unexpected failure'),/Windows 安全检查失败：some unexpected failure/);
+ assert.match(explain(''),/Windows 安全检查失败/);
+});

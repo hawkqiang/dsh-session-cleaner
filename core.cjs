@@ -101,22 +101,68 @@ public static class ScopedLogRemoval {
  }
 }
 '@
+`;
+// The process gate is the only difference between offline and live mode; both keep
+// the per-session writer semaphore and the exclusive handle.
+const nativeGate=String.raw`
 $procs=@(Get-CimInstance Win32_Process -ErrorAction Stop)
 if (!$procs.Count) {throw 'Cannot verify DSH shutdown'}
 foreach($p in $procs){if ($p.ProcessId -eq $PID -or $p.ProcessId -eq [int]$env:CLEANER_PID){continue};if($p.Name -match '^(DeepSeek[ -]?Harness|dsh)(\.exe)?$'){throw 'Close DSH Desktop and CLI first'};if($p.Name -match '^(node|electron|bun|deno)(\.exe)?$'){if(!$p.CommandLine -or !$p.ExecutablePath){throw 'Cannot verify runtime process'};if(($p.CommandLine+' '+$p.ExecutablePath) -match '(?i)(deepseek[ -]harness|[\\/]dsh(?:[\\/.\s"]|$)|@deepseek-ai[\\/]dsh)'){throw 'Close all DSH runtimes first'}}}
-[ScopedLogRemoval]::Remove($env:CLEANER_FILE,$env:CLEANER_SHA,$env:CLEANER_LEASE)
 `;
-// Live mode keeps every check except the "all DSH processes are closed" gate: the
-// same per-session writer semaphore and exclusive handle still guard the deletion.
-const nativeLive=(()=>{const gate=native.indexOf('$procs=@(Get-CimInstance'),call=native.indexOf('[ScopedLogRemoval]::Remove');if(gate<0||call<=gate)return native;return native.slice(0,gate)+native.slice(call)})();
+// A refusal writes its own reason to CLEANER_ERR: no stdio pipes, so the same script
+// works under restricted sandboxes and the page can name the cause.
+const nativeRemove=String.raw`[ScopedLogRemoval]::Remove($env:CLEANER_FILE,$env:CLEANER_SHA,$env:CLEANER_LEASE)`;
+const nativeTryOpen=String.raw`
+try {
+`;
+const nativeTryCatch=String.raw`
+} catch {
+ try { [IO.File]::WriteAllText($env:CLEANER_ERR, [string]$_.Exception.Message) } catch {}
+ exit 1
+}
+`;
+function composeNative(withGate){
+ return native+nativeTryOpen+(withGate?nativeGate:'')+nativeRemove+nativeTryCatch;
+}
+const nativeLive=composeNative(false);
+// Translate the native check's own diagnostics into a reason the page can show,
+// so a refusal explains itself instead of guessing.
+const NATIVE_HINTS=[
+ [/DSH writer is still active/, '该会话仍有 DSH 写入句柄，请关闭这个对话再试'],
+ [/being used by another process|sharing violation/i, '日志正被其他程序打开，请关闭该对话或稍后重试'],
+ [/Reparse directory refused/, '路径经过符号链接或联接点，已拒绝删除'],
+ [/A local fixed NTFS volume is required/, '需要本机固定的 NTFS 卷'],
+ [/Unexpected final path/, '文件实际位置与预期不符，已拒绝'],
+ [/Alternate data streams refused/, '文件带有备用数据流，已拒绝'],
+ [/Hard links refused/, '文件是硬链接，已拒绝'],
+ [/Log content changed/, '日志内容已变化，请重新删除'],
+ [/Unexpected session-local files/, '会话目录里还有其他文件，已拒绝'],
+];
+function explain(output){
+ const lines=String(output||'').replace(/\u001b\[[0-9;]*m/g,'').split(/\r?\n/).map(x=>x.trim()).filter(Boolean);
+ const blob=lines.join(' | ');
+ for(const [pattern,message] of NATIVE_HINTS)if(pattern.test(blob))return message;
+ return lines.length?`Windows 安全检查失败：${lines[lines.length-1].slice(0,200)}`:'Windows 安全检查失败';
+}
+async function runNative(script,env){
+ const exe=path.join(process.env.SystemRoot,'System32','WindowsPowerShell','v1.0','powershell.exe');
+ const errFile=path.join(process.env.TEMP??process.env.TMP??'.',`dsh-cleaner-${crypto.randomUUID()}.log`);
+ try{
+  const code=await new Promise((resolve,reject)=>{
+   const cp=spawn(exe,['-NoProfile','-NonInteractive','-EncodedCommand',Buffer.from(script,'utf16le').toString('base64')],{stdio:'ignore',windowsHide:true,env:{...process.env,...env,CLEANER_ERR:errFile}});
+   cp.once('error',reject);cp.once('exit',value=>resolve(value));
+  });
+  if(code!==0){const detail=await fs.readFile(errFile,'utf8').catch(()=>'');fail(explain(detail));}
+ }finally{await fs.unlink(errFile).catch(()=>{});}
+}
 async function executePlan(opts){
   if(opts.offlineConfirmed!==true&&opts.liveConfirmed!==true)fail('Explicit confirmation required');
   if(process.platform!=='win32')fail('Windows only');
-  const {f,p}=await loadPlan(opts);const lease='Local\\dsh-session-lock-'+hash(path.resolve(path.dirname(f),'session.lock').toLowerCase());const script=opts.liveConfirmed===true?nativeLive:native;const exe=path.join(process.env.SystemRoot,'System32','WindowsPowerShell','v1.0','powershell.exe');
-  await new Promise((res,rej)=>{const cp=spawn(exe,['-NoProfile','-NonInteractive','-EncodedCommand',Buffer.from(script,'utf16le').toString('base64')],{stdio:'inherit',windowsHide:true,env:{...process.env,CLEANER_FILE:f,CLEANER_SHA:p.sha,CLEANER_LEASE:lease,CLEANER_PID:String(process.pid)}});cp.once('error',rej);cp.once('exit',code=>code===0?res():rej(Error('Safety checks or Windows deletion failed; see diagnostic output')))});
+  const {f,p}=await loadPlan(opts);const lease='Local\\dsh-session-lock-'+hash(path.resolve(path.dirname(f),'session.lock').toLowerCase());
+  await runNative(composeNative(opts.liveConfirmed!==true),{CLEANER_FILE:f,CLEANER_SHA:p.sha,CLEANER_LEASE:lease,CLEANER_PID:String(process.pid)});
   return {sessionId:p.sessionId,bytes:Number(p.sig[2]),deletedFiles:1};
 }
-module.exports={preparePlan,executePlan,inspectPlan:loadPlan,removeVerified};
+module.exports={preparePlan,executePlan,inspectPlan:loadPlan,removeVerified,explain,composeNative};
 
 // Delete one already-previewed log by its verified content hash. Used when the
 // signed plan expired or lost its archive epoch: the hash still proves the bytes
@@ -130,7 +176,6 @@ async function removeVerified({file,sha,liveConfirmed}){
   const actual=await digest(file);if(actual!==sha)fail('Log content changed since preview');
   const bytes=Number((await fs.stat(file)).size);
   const lease='Local\\dsh-session-lock-'+hash(path.resolve(path.join(dir,'session.lock')).toLowerCase());
-  const exe=path.join(process.env.SystemRoot,'System32','WindowsPowerShell','v1.0','powershell.exe');
-  await new Promise((res,rej)=>{const cp=spawn(exe,['-NoProfile','-NonInteractive','-EncodedCommand',Buffer.from(nativeLive,'utf16le').toString('base64')],{stdio:'inherit',windowsHide:true,env:{...process.env,CLEANER_FILE:file,CLEANER_SHA:sha,CLEANER_LEASE:lease,CLEANER_PID:String(process.pid)}});cp.once('error',rej);cp.once('exit',code=>code===0?res():rej(Error('Safety checks or Windows deletion failed; see diagnostic output')))});
+  await runNative(nativeLive,{CLEANER_FILE:file,CLEANER_SHA:sha,CLEANER_LEASE:lease,CLEANER_PID:String(process.pid)});
   return {file,bytes};
 }

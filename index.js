@@ -6,9 +6,24 @@ import core from './core.cjs';
 import host from './host.cjs';
 
 export const inject=['workspaceRegistry','sessionPersistence','connection'];
+// Bump together with package.json. The startup line in host.log proves which
+// Host code the running DSH actually loaded.
+const VERSION='1.3.2';
 export function apply(ctx){
   if(process.platform!=='win32')return;
-  let stop,disposed=false,revision=0,guard,failed=false,planDir;
+  let stop,disposed=false,revision=0,guard,failed=false,planDir,logFile;
+  // Diagnostics only: a rejection reason the page saw, so a failure can be explained
+  // later without reproducing it. Never records chat content.
+  async function note(line){
+    if(!logFile)return;
+    try{
+      const stamp=new Date().toISOString();
+      const old=await fs.readFile(logFile,'utf8').catch(()=>'');
+      const lines=old.split('\n').filter(Boolean);
+      lines.push(`${stamp} ${line}`);
+      await fs.writeFile(logFile,lines.slice(-200).join('\n')+'\n',{mode:0o600});
+    }catch{/* diagnostics must never break the operation */}
+  }
   // Session unarchive runs inside the registry queue before it changes membership.
   async function invalidate(){revision++;if(!guard)return;const tmp=guard+'.'+randomUUID();try{await fs.writeFile(tmp,randomUUID(),{flag:'wx',mode:0o600});await fs.rename(tmp,guard);}catch(e){failed=true;throw e;}finally{await fs.unlink(tmp).catch(()=>{});}}
   ctx.on('workspace/session-unarchiving',invalidate);
@@ -47,7 +62,7 @@ export function apply(ctx){
         let body;try{body=await request.json();}catch{return Response.json({ok:false,error:'请求格式错误'},{status:400});}
         if(!readId(body))return Response.json({ok:false,error:'无效的会话 ID'},{status:400});
         try{return Response.json({ok:true,...await inspectArchived(body.sessionId)});}
-        catch(e){return Response.json({ok:false,error:String(e?.message??e).slice(0,300)});}
+        catch(e){const message=String(e?.message??e).slice(0,300);await note(`inspect ${body.sessionId} refused: ${message}`);return Response.json({ok:false,error:message});}
       }
     });
     const remove=ctx.connection.fetch.register({
@@ -58,7 +73,7 @@ export function apply(ctx){
         let body;try{body=await request.json();}catch{return Response.json({ok:false,error:'请求格式错误'},{status:400});}
         if(!readId(body))return Response.json({ok:false,error:'无效的会话 ID'},{status:400});
         try{return Response.json({ok:true,...await deleteArchived(body.sessionId,body.withChildren===true)});}
-        catch(e){return Response.json({ok:false,error:String(e?.message??e).slice(0,300)});}
+        catch(e){const message=String(e?.message??e).slice(0,300);await note(`delete ${body.sessionId} failed: ${message}`);return Response.json({ok:false,error:message});}
       }
     });
     return ()=>{for(const dispose of [inspect,remove])void Promise.resolve(dispose()).catch(()=>{});};
@@ -68,7 +83,9 @@ export function apply(ctx){
     const startup=(async()=>{
       const base=await bridge.baseDir(),profile=process.env.DSH_PROFILE_DIR ? await fs.realpath(process.env.DSH_PROFILE_DIR) : base;
       const key=createHash('sha256').update(profile.toLowerCase()).digest('hex');planDir=path.join(base,'plans-'+key);
+      logFile=path.join(base,'host.log');
       guard=path.join(base,'archive-epoch-'+key);await invalidate();if(disposed)return;
+      await note(`host started v${VERSION} profile=${path.basename(profile)} pid=${process.pid}`);
       const halt=await bridge.start(async(sessionId)=>{
         if(disposed||!archived(sessionId))throw Error('该会话未归档，或插件状态已变化。');
         const snapshots=await ctx.sessionPersistence.list();const target=snapshots.find(x=>x.header?.id===sessionId);

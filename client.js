@@ -3,6 +3,15 @@ window.__ModuleLoader__.load({
   factory() {
     const clean = value => String(value ?? '').replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, ' ').slice(0, 160);
     const fill = (template, values) => template.replace(/\{(\w+)\}/g, (_, key) => String(values[key] ?? ''));
+    const post = async (path, body) => {
+      const response = await fetch(path, {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body)
+      });
+      return response.json();
+    };
     return {
       inject: ['contextMenus', 'workspaces', 'sessions', 'locale'],
       apply(ctx) {
@@ -11,8 +20,11 @@ window.__ModuleLoader__.load({
           menu: '永久删除…',
           need: '请先归档这条会话；删除只对已归档会话生效。',
           untitled: '无标题',
-          confirm: '永久删除「{title}」？\n\n会话 ID：{id}\n将删除磁盘上的会话日志，不进回收站，无法恢复。',
-          done: '已永久删除「{title}」，日志文件 {bytes} 字节已移除。',
+          confirm: '永久删除「{title}」？\n\n会话 ID：{id}\n日志 {bytes} 字节，不进回收站，无法恢复。',
+          confirmTree: '「{title}」有 {count} 个子会话，删除父会话会连同它们一起永久删除：\n\n{list}\n\n删除后均无法恢复，确认吗？',
+          subagentHint: '（子代理）',
+          more: '…另外还有 {count} 个',
+          done: '已永久删除「{title}」，移除 {deleted} 份日志、{bytes} 字节。',
           doneStale: '「{title}」的日志已删除（{bytes} 字节），列表会随下次刷新消失。',
           fail: '未删除：{error}'
         };
@@ -20,13 +32,18 @@ window.__ModuleLoader__.load({
           menu: 'Delete permanently…',
           need: 'Archive this session first; deletion only applies to archived sessions.',
           untitled: 'Untitled',
-          confirm: 'Permanently delete "{title}"?\n\nSession ID: {id}\nThis removes the session log from disk. It does not go to the Recycle Bin and cannot be undone.',
-          done: 'Permanently deleted "{title}"; {bytes} bytes of session log removed.',
-          doneStale: 'Permanently deleted "{title}" ({bytes} bytes of log); the row clears on the next list refresh.',
+          confirm: 'Permanently delete "{title}"?\n\nSession ID: {id}\n{bytes} bytes of session log. It does not go to the Recycle Bin and cannot be undone.',
+          confirmTree: '"{title}" has {count} child sessions. Deleting it also permanently deletes:\n\n{list}\n\nNone of this can be undone. Continue?',
+          subagentHint: ' (subagent)',
+          more: '…and {count} more',
+          done: 'Permanently deleted "{title}"; {deleted} logs and {bytes} bytes removed.',
+          doneStale: 'Deleted "{title}" ({bytes} bytes); the row clears on the next list refresh.',
           fail: 'Not deleted: {error}'
         };
         ctx.effect(() => ctx.locale.register(ns, { zh, en }));
         const t = (key, values) => fill(String(ctx.locale.bind(ns)(key) ?? key), values ?? {});
+        const fail = error => ctx.contextMenus.notify(t('fail', { error: clean(error?.message ?? error) || '?' }), false);
+
         ctx.effect(() => ctx.contextMenus.register({
           id: 'local-session-cleaner.delete',
           target: 'session',
@@ -39,28 +56,29 @@ window.__ModuleLoader__.load({
               if (!archived.includes(sessionId)) { ctx.contextMenus.notify(t('need'), false); return; }
               const title = clean(displayTitle) || t('untitled');
               const id = clean(sessionId);
-              if (!window.confirm(t('confirm', { title, id }))) return;
+              let info;
+              try { info = await post('/api/session-cleaner/inspect', { sessionId }); }
+              catch (error) { fail(error); return; }
+              if (!info?.ok) { fail(info?.error ?? '?'); return; }
+              const children = Array.isArray(info.children) ? info.children : [];
+              let message = t('confirm', { title, id, bytes: info.bytes ?? 0 });
+              if (children.length > 0) {
+                const shown = children.slice(0, 5).map(child => `· ${clean(child.title) || clean(child.id)}${child.origin === 'subagent' ? t('subagentHint') : ''}`);
+                if (children.length > shown.length) shown.push(t('more', { count: children.length - shown.length }));
+                message = t('confirmTree', { title, count: children.length, list: shown.join('\n') });
+              }
+              if (!window.confirm(message)) return;
               let data;
               try {
-                const response = await fetch('/api/session-cleaner/delete', {
-                  method: 'POST',
-                  credentials: 'same-origin',
-                  headers: { 'Content-Type': 'application/json' },
-                  body: JSON.stringify({ sessionId })
-                });
-                data = await response.json();
-              } catch (error) {
-                ctx.contextMenus.notify(t('fail', { error: clean(error?.message ?? error) }), false);
-                return;
-              }
-              if (!data?.ok) {
-                ctx.contextMenus.notify(t('fail', { error: clean(data?.error) || '?' }), false);
-                return;
-              }
-              try { await ctx.sessions.refresh(); } catch { /* the row disappears on the next refresh */ }
+                data = await post('/api/session-cleaner/delete', { sessionId, withChildren: children.length > 0 });
+              } catch (error) { fail(error); return; }
+              if (!data?.ok) { fail(data?.error ?? '?'); return; }
+              try { await ctx.sessions.refresh(); } catch { /* the row clears on the next refresh */ }
               let still = false;
               try { still = ctx.sessions.list.getSnapshot().ids.includes(sessionId); } catch { /* snapshot shape changed */ }
-              ctx.contextMenus.notify(t(still ? 'doneStale' : 'done', { title, bytes: data.bytes ?? 0 }), true);
+              ctx.contextMenus.notify(still
+                ? t('doneStale', { title, bytes: data.bytes ?? 0 })
+                : t('done', { title, bytes: data.bytes ?? 0, deleted: data.deleted ?? 1 }), true);
             }
           }]
         }));

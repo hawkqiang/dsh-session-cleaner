@@ -15,32 +15,53 @@ export function apply(ctx){
 
   const archived=id=>ctx.workspaceRegistry.archivedSessionIds.includes(id);
 
+  // Inspect the verified target and its descendant tree before the page asks for
+  // confirmation, so the dialog can name what a cascade removal would destroy.
+  async function inspectArchived(sessionId){
+    if(failed||disposed||!planDir||!guard)throw Error('插件尚未就绪，请重开 DSH');
+    if(!archived(sessionId))throw Error('该会话未归档，删除只对已归档会话生效');
+    return host.describeTree({sessionId,snapshots:await ctx.sessionPersistence.list()});
+  }
+
   // Verify the provider snapshot, plan, delete with the writer semaphore held, then
-  // prove the log is gone. Shared by the page route and the external assistant.
-  async function deleteArchived(sessionId){
+  // prove every log is gone. Shared by the page route and the external assistant.
+  async function deleteArchived(sessionId,withChildren){
     if(failed||disposed||!planDir||!guard)throw Error('插件尚未就绪，请重开 DSH');
     if(!archived(sessionId))throw Error('该会话未归档，已拒绝删除');
     const snapshots=await ctx.sessionPersistence.list();
     const at=revision;
-    return host.removePlannedSession({sessionId,snapshots,planDir,guard,core,stillValid:()=>!disposed&&!failed&&at===revision&&archived(sessionId)});
+    return host.removeTree({sessionId,snapshots,planDir,guard,core,withChildren,
+      list:()=>ctx.sessionPersistence.list(),
+      stillValid:()=>!disposed&&!failed&&at===revision&&archived(sessionId)});
   }
 
-  // Same-origin page route: the browser reaches it through DSH's authenticated API
-  // channel, so the client needs no token of its own.
+  // Same-origin page routes: the browser reaches them through DSH's authenticated
+  // API channel, so the client needs no token of its own.
   ctx.effect(()=>{
-    const dispose=ctx.connection.fetch.register({
+    const readId=body=>typeof body?.sessionId==='string'&&/^[A-Za-z0-9_-]{1,160}$/.test(body.sessionId);
+    const inspect=ctx.connection.fetch.register({
+      path:'/api/session-cleaner/inspect',
+      methods:['POST'],
+      requestBody:'buffered',
+      fetch:async request=>{
+        let body;try{body=await request.json();}catch{return Response.json({ok:false,error:'请求格式错误'},{status:400});}
+        if(!readId(body))return Response.json({ok:false,error:'无效的会话 ID'},{status:400});
+        try{return Response.json({ok:true,...await inspectArchived(body.sessionId)});}
+        catch(e){return Response.json({ok:false,error:String(e?.message??e).slice(0,300)});}
+      }
+    });
+    const remove=ctx.connection.fetch.register({
       path:'/api/session-cleaner/delete',
       methods:['POST'],
       requestBody:'buffered',
       fetch:async request=>{
         let body;try{body=await request.json();}catch{return Response.json({ok:false,error:'请求格式错误'},{status:400});}
-        const sessionId=body?.sessionId;
-        if(typeof sessionId!=='string'||!/^[A-Za-z0-9_-]{1,160}$/.test(sessionId))return Response.json({ok:false,error:'无效的会话 ID'},{status:400});
-        try{return Response.json({ok:true,...await deleteArchived(sessionId)});}
+        if(!readId(body))return Response.json({ok:false,error:'无效的会话 ID'},{status:400});
+        try{return Response.json({ok:true,...await deleteArchived(body.sessionId,body.withChildren===true)});}
         catch(e){return Response.json({ok:false,error:String(e?.message??e).slice(0,300)});}
       }
     });
-    return ()=>{void Promise.resolve(dispose()).catch(()=>{});};
+    return ()=>{for(const dispose of [inspect,remove])void Promise.resolve(dispose()).catch(()=>{});};
   });
 
   ctx.effect(()=>{

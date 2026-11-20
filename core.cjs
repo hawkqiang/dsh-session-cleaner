@@ -13,10 +13,16 @@ function rootPath(p){if(typeof p!=='string'||!path.isAbsolute(p)||path.resolve(p
 async function checkDir(p){rootPath(p);for(let q=p;;q=path.dirname(q)){const s=await fs.lstat(q);if(!s.isDirectory()||s.isSymbolicLink())fail('Unexpected directory type');if(q===path.dirname(q))break}if(path.normalize(await fs.realpath(p)).toLowerCase()!==p.toLowerCase())fail('Redirected directory');}
 async function oneFile(f){await checkDir(path.dirname(f));const s=await fs.lstat(f,{bigint:true});if(!s.isFile()||s.isSymbolicLink()||s.nlink!==1n||s.size>BigInt(Number.MAX_SAFE_INTEGER))fail('Expected a single-link regular file');return [String(s.dev),String(s.ino),String(s.size),String(s.mtimeNs),String(s.ctimeNs)]}
 async function digest(f){const h=await fs.open(f,'r');try{const s=await h.stat({bigint:true});if(!s.isFile()||s.nlink!==1n)fail('Unsafe log');const sum=crypto.createHash('sha256');for await(const chunk of h.createReadStream({autoClose:false}))sum.update(chunk);return sum.digest('hex')}finally{await h.close()}}
-function admit({sessionId,archived,snapshots}){
+function admit({sessionId,archived,snapshots,allowTree=false}){
  if(!simpleId(sessionId)||archived!==true||!Array.isArray(snapshots))fail('Archived session with verified provider inventory required');
- const seen=new Set();let target;for(const s of snapshots){const h=s?.header;if(!h||typeof h.id!=='string'||seen.has(h.id)||h.version!==4)fail('Incomplete or ambiguous provider inventory');seen.add(h.id);if(h.parentSession===sessionId)fail('Session has child sessions');if(h.id===sessionId)target=s}
- const h=target?.header;if(!h||target.formatStatus!=='current'||target.location?.kind!=='jsonl'||h.isSeeded!==false||h.parentSession!==undefined||h.origin!==undefined||(h.delegationDepth??0)!==0)fail('Only independent current-format JSONL sessions qualify');return target;
+ const seen=new Set();let target;for(const s of snapshots){const h=s?.header;if(!h||typeof h.id!=='string'||seen.has(h.id)||h.version!==4)fail('Incomplete or ambiguous provider inventory');seen.add(h.id);if(!allowTree&&h.parentSession===sessionId)fail('Session has child sessions');if(h.id===sessionId)target=s}
+ const h=target?.header;
+ if(!h||target.formatStatus!=='current'||target.location?.kind!=='jsonl')fail('Only independent current-format JSONL sessions qualify');
+ // A cascade member is deleted as part of its own tree, so its parent link and
+ // inherited prefix disappear together with the ancestor that carries them.
+ if(!allowTree&&(h.isSeeded!==false||h.parentSession!==undefined||h.origin!==undefined||(h.delegationDepth??0)!==0))fail('Only independent current-format JSONL sessions qualify');
+ if(allowTree){const depth=h.delegationDepth??0;if(!Number.isSafeInteger(depth)||depth<0)fail('Unknown delegation depth')}
+ return target;
 }
 function location(root,file,id){rootPath(root);rootPath(file);if(!simpleId(id))fail('Invalid Session ID');const a=path.relative(root,file).split(path.sep);if(a.length!==3||!/^(_no-cwd|--[A-Za-z0-9._~\-]+--)$/.test(a[0])||a[1]!==id||!/^session\.v4\.jsonl(?:\.zstd)?$/.test(a[2]))fail('Unsupported provider layout');return a}
 // Folder names only, never access unrelated transcript contents. A newly-created
@@ -46,8 +52,8 @@ async function singleGeneration(f){const a=await fs.readdir(path.dirname(f));if(
 async function privateDir(d,root,create){rootPath(d);rootPath(root);for(const [a,b] of [[d,root],[root,d]]){const rel=path.relative(a,b);if(rel===''||(!rel.startsWith('..'+path.sep)&&rel!=='..'&&!path.isAbsolute(rel)))fail('Plan directory must be separate from store')}if(create){await checkDir(path.dirname(d));await fs.mkdir(d,{mode:0o700}).catch(e=>{if(e.code!=='EEXIST')throw e})}await checkDir(d)}
 async function keyAt(d,create){const f=path.join(d,'plan-auth.key');if(create){try{await fs.writeFile(f,crypto.randomBytes(32),{flag:'wx',mode:0o600})}catch(e){if(e.code!=='EEXIST')throw e}}await oneFile(f);const k=await fs.readFile(f);if(k.length!==32)fail('Bad local plan key');return k}
 function mac(k,p){return crypto.createHmac('sha256',k).update(JSON.stringify(p)).digest('hex')}
-async function preparePlan({root,sessionId,archived,snapshots,planDir,archiveStateFile}){
- const epoch=rootPath(archiveStateFile),epochSig=await oneFile(epoch);const s=admit({sessionId,archived,snapshots});const f=s.location.path;const rel=location(root,f,sessionId);const cs=await census(root,snapshots);const sig=await singleGeneration(f);const sha=await digest(f);if(JSON.stringify(sig)!==JSON.stringify(await singleGeneration(f))||Number(sig[2])!==s.sizeBytes||cs!==await census(root))fail('Storage changed during planning');
+async function preparePlan({root,sessionId,archived,snapshots,planDir,archiveStateFile,allowTree=false}){
+ const epoch=rootPath(archiveStateFile),epochSig=await oneFile(epoch);const s=admit({sessionId,archived,snapshots,allowTree});const f=s.location.path;const rel=location(root,f,sessionId);const cs=await census(root,snapshots);const sig=await singleGeneration(f);const sha=await digest(f);if(JSON.stringify(sig)!==JSON.stringify(await singleGeneration(f))||Number(sig[2])!==s.sizeBytes||cs!==await census(root))fail('Storage changed during planning');
  const planId=crypto.randomUUID(),p={version:1,planId,sessionId,root,rel,created:Date.now(),sig,sha,census:cs};p.archiveStateFile=epoch;p.archiveSig=epochSig;if(JSON.stringify(epochSig)!==JSON.stringify(await oneFile(epoch)))fail('Archive state changed during planning');
  await privateDir(planDir,root,true);const k=await keyAt(planDir,true);await fs.writeFile(path.join(planDir,planId+'.json'),JSON.stringify({p,auth:mac(k,p)}),{mode:0o600,flag:'wx'});return {planId,sessionId,bytes:Number(sig[2])};
 }

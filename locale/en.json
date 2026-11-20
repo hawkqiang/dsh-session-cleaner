@@ -1,1 +1,1 @@
-{"meta":{"title":"Offline session cleaner","description":"Preview one eligible archived session log, then confirm permanent removal in a separate Windows assistant after DSH exits. No bulk deletion."}}
+{"meta":{"title":"Session cleaner","description":"Preview and permanently delete one archived session log while DSH stays open. The assistant re-verifies the target and holds the same writer lock DSH uses. No bulk deletion."}}

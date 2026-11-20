@@ -100,5 +100,31 @@ if (!$procs.Count) {throw 'Cannot verify DSH shutdown'}
 foreach($p in $procs){if ($p.ProcessId -eq $PID -or $p.ProcessId -eq [int]$env:CLEANER_PID){continue};if($p.Name -match '^(DeepSeek[ -]?Harness|dsh)(\.exe)?$'){throw 'Close DSH Desktop and CLI first'};if($p.Name -match '^(node|electron|bun|deno)(\.exe)?$'){if(!$p.CommandLine -or !$p.ExecutablePath){throw 'Cannot verify runtime process'};if(($p.CommandLine+' '+$p.ExecutablePath) -match '(?i)(deepseek[ -]harness|[\\/]dsh(?:[\\/.\s"]|$)|@deepseek-ai[\\/]dsh)'){throw 'Close all DSH runtimes first'}}}
 [ScopedLogRemoval]::Remove($env:CLEANER_FILE,$env:CLEANER_SHA,$env:CLEANER_LEASE)
 `;
-async function executePlan(opts){if(opts.offlineConfirmed!==true)fail('Confirm all DSH hosts are shut down and will not restart');if(process.platform!=='win32')fail('Windows only');const {f,p}=await loadPlan(opts);const lease='Local\\dsh-session-lock-'+hash(path.resolve(path.dirname(f),'session.lock').toLowerCase());const exe=path.join(process.env.SystemRoot,'System32','WindowsPowerShell','v1.0','powershell.exe');await new Promise((res,rej)=>{const cp=spawn(exe,['-NoProfile','-NonInteractive','-EncodedCommand',Buffer.from(native,'utf16le').toString('base64')],{stdio:'inherit',windowsHide:true,env:{...process.env,CLEANER_FILE:f,CLEANER_SHA:p.sha,CLEANER_LEASE:lease,CLEANER_PID:String(process.pid)}});cp.once('error',rej);cp.once('exit',code=>code===0?res():rej(Error('Offline safety checks or Windows deletion failed; see diagnostic output')))});return {sessionId:p.sessionId,bytes:Number(p.sig[2]),deletedFiles:1};}
-module.exports={preparePlan,executePlan,inspectPlan:loadPlan};
+// Live mode keeps every check except the "all DSH processes are closed" gate: the
+// same per-session writer semaphore and exclusive handle still guard the deletion.
+const nativeLive=(()=>{const gate=native.indexOf('$procs=@(Get-CimInstance'),call=native.indexOf('[ScopedLogRemoval]::Remove');if(gate<0||call<=gate)return native;return native.slice(0,gate)+native.slice(call)})();
+async function executePlan(opts){
+  if(opts.offlineConfirmed!==true&&opts.liveConfirmed!==true)fail('Explicit confirmation required');
+  if(process.platform!=='win32')fail('Windows only');
+  const {f,p}=await loadPlan(opts);const lease='Local\\dsh-session-lock-'+hash(path.resolve(path.dirname(f),'session.lock').toLowerCase());const script=opts.liveConfirmed===true?nativeLive:native;const exe=path.join(process.env.SystemRoot,'System32','WindowsPowerShell','v1.0','powershell.exe');
+  await new Promise((res,rej)=>{const cp=spawn(exe,['-NoProfile','-NonInteractive','-EncodedCommand',Buffer.from(script,'utf16le').toString('base64')],{stdio:'inherit',windowsHide:true,env:{...process.env,CLEANER_FILE:f,CLEANER_SHA:p.sha,CLEANER_LEASE:lease,CLEANER_PID:String(process.pid)}});cp.once('error',rej);cp.once('exit',code=>code===0?res():rej(Error('Safety checks or Windows deletion failed; see diagnostic output')))});
+  return {sessionId:p.sessionId,bytes:Number(p.sig[2]),deletedFiles:1};
+}
+module.exports={preparePlan,executePlan,inspectPlan:loadPlan,removeVerified};
+
+// Delete one already-previewed log by its verified content hash. Used when the
+// signed plan expired or lost its archive epoch: the hash still proves the bytes
+// are the ones the user previewed. Live mode keeps the writer semaphore and the
+// exclusive handle, so an active writer or an open reader still refuses.
+async function removeVerified({file,sha,liveConfirmed}){
+  if(liveConfirmed!==true)fail('Explicit confirmation required');
+  if(process.platform!=='win32')fail('Windows only');
+  rootPath(file);if(typeof sha!=='string'||!/^[0-9a-f]{64}$/.test(sha))fail('Invalid content hash');
+  const dir=path.dirname(file);await checkDir(dir);const entries=await fs.readdir(dir);if(entries.length!==1||entries[0]!==path.basename(file))fail('Refusing multiple generations or unexpected session-local artifacts');
+  const actual=await digest(file);if(actual!==sha)fail('Log content changed since preview');
+  const bytes=Number((await fs.stat(file)).size);
+  const lease='Local\\dsh-session-lock-'+hash(path.resolve(path.join(dir,'session.lock')).toLowerCase());
+  const exe=path.join(process.env.SystemRoot,'System32','WindowsPowerShell','v1.0','powershell.exe');
+  await new Promise((res,rej)=>{const cp=spawn(exe,['-NoProfile','-NonInteractive','-EncodedCommand',Buffer.from(nativeLive,'utf16le').toString('base64')],{stdio:'inherit',windowsHide:true,env:{...process.env,CLEANER_FILE:file,CLEANER_SHA:sha,CLEANER_LEASE:lease,CLEANER_PID:String(process.pid)}});cp.once('error',rej);cp.once('exit',code=>code===0?res():rej(Error('Safety checks or Windows deletion failed; see diagnostic output')))});
+  return {file,bytes};
+}

@@ -99,4 +99,61 @@ async function removeTree({sessionId, snapshots, planDir, guard, core, withChild
   return {bytes: total, deleted: ids.length, title: typeof root?.header?.title === 'string' ? root.header.title : undefined};
 }
 
-module.exports = {removeTree, describeTree, descendantsOf, pickTarget};
+module.exports = {removeTree, describeTree, descendantsOf, pickTarget, readPending, enqueuePending, processPending};
+
+// DSH keeps a write handle on sessions it has loaded, so an in-app deletion can be
+// refused while the app runs. Such a request is queued and executed on the next Host
+// start, before the session is opened again.
+const PENDING = 'pending-deletions.json';
+const BUSY = /被 DSH 占用|正被其他程序打开|still active|being used by another process|sharing violation/i;
+
+async function readPending(dir) {
+  try {
+    const parsed = JSON.parse(await fs.readFile(path.join(dir, PENDING), 'utf8'));
+    return Array.isArray(parsed) ? parsed.filter(e => typeof e?.sessionId === 'string') : [];
+  } catch { return []; }
+}
+
+async function writePending(dir, entries) {
+  const file = path.join(dir, PENDING);
+  await fs.mkdir(dir, {recursive: true, mode: 0o700});
+  const temp = `${file}.${process.pid}.tmp`;
+  await fs.writeFile(temp, JSON.stringify(entries.slice(0, 50)), {mode: 0o600});
+  await fs.rename(temp, file);
+}
+
+async function enqueuePending(dir, sessionId, title) {
+  const entries = await readPending(dir);
+  if (!entries.some(entry => entry.sessionId === sessionId)) {
+    entries.push({sessionId, title: typeof title === 'string' ? title.slice(0, 200) : undefined, queuedAt: new Date().toISOString()});
+    await writePending(dir, entries);
+  }
+  return entries.length;
+}
+
+/**
+ * Retry queued deletions, dropping entries whose session is gone or was removed.
+ * @param options - plan directory, `list` for provider snapshots, `attempt` to delete
+ *   one id (throwing on refusal) and `log` for the diagnostic line.
+ */
+async function processPending({dir, list, attempt, log}) {
+  const entries = await readPending(dir);
+  if (entries.length === 0) return {done: 0, kept: 0};
+  const remaining = [];
+  let done = 0;
+  for (const entry of entries) {
+    const snapshots = await list();
+    if (!snapshots.some(s => s?.header?.id === entry.sessionId)) { done += 1; continue; }
+    try {
+      await attempt(entry.sessionId);
+      done += 1;
+      await log?.(`pending delete ${entry.sessionId} done`);
+    } catch (error) {
+      const message = String(error?.message ?? error);
+      if (BUSY.test(message)) { remaining.push(entry); await log?.(`pending delete ${entry.sessionId} still busy`); }
+      else { await log?.(`pending delete ${entry.sessionId} dropped: ${message}`); }
+    }
+  }
+  await writePending(dir, remaining);
+  return {done, kept: remaining.length};
+}

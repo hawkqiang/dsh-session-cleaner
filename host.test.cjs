@@ -29,6 +29,34 @@ test('host path deletes a leaf session and reports its size', async t=>{
  await assert.rejects(fs.stat(a.snapshots[0].location.path),{code:'ENOENT'});
 });
 
+test('queued deletions are retried on the next start and kept while still busy', async t=>{
+ const a=await fixture(t);
+ const {enqueuePending,processPending,readPending}=require('./host.cjs');
+ await enqueuePending(a.planDir,'mock-201','Synthetic chat');
+ assert.equal((await readPending(a.planDir)).length,1);
+
+ const busy={...core,executePlan:()=>{throw Error('该会话仍被 DSH 占用：先切换到其他对话')}};
+ const first=await processPending({dir:a.planDir,list:async()=>a.snapshots,
+  attempt:async id=>removeTree({...a,sessionId:id,core:busy,attempts:1})});
+ assert.deepEqual(first,{done:0,kept:1});
+ assert.equal((await readPending(a.planDir)).length,1);
+
+ const second=await processPending({dir:a.planDir,list:async()=>a.snapshots,
+  attempt:async id=>removeTree({...a,sessionId:id,core})});
+ assert.deepEqual(second,{done:1,kept:0});
+ assert.equal((await readPending(a.planDir)).length,0);
+ await assert.rejects(fs.stat(a.snapshots[0].location.path),{code:'ENOENT'});
+});
+
+test('a queued session that disappeared is dropped from the queue', async t=>{
+ const a=await fixture(t);
+ const {enqueuePending,processPending,readPending}=require('./host.cjs');
+ await enqueuePending(a.planDir,'gone-forever');
+ const outcome=await processPending({dir:a.planDir,list:async()=>a.snapshots,attempt:async()=>{throw Error('should not run')}});
+ assert.deepEqual(outcome,{done:1,kept:0});
+ assert.equal((await readPending(a.planDir)).length,0);
+});
+
 test('host path retries a transient busy writer and gives up on a persistent one', async t=>{
  const a=await fixture(t);
  const busy=()=>{throw Error('该会话仍被 DSH 占用：先切换到其他对话让它关闭后再试')};

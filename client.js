@@ -25,6 +25,7 @@ window.__ModuleLoader__.load({
           subagentHint: '（子代理）',
           more: '…另外还有 {count} 个',
           done: '已永久删除「{title}」，移除 {deleted} 份日志、{bytes} 字节。',
+          queued: '「{title}」正被 DSH 占用，已排队：下次启动 DSH 时会自动删除它（重启后不必再点一次）。',
           doneStale: '「{title}」的日志已删除（{bytes} 字节），列表会随下次刷新消失。',
           fail: '未删除：{error}'
         };
@@ -37,6 +38,7 @@ window.__ModuleLoader__.load({
           subagentHint: ' (subagent)',
           more: '…and {count} more',
           done: 'Permanently deleted "{title}"; {deleted} logs and {bytes} bytes removed.',
+          queued: '"{title}" is still held by DSH, so it is queued: it will be deleted automatically on the next DSH start.',
           doneStale: 'Deleted "{title}" ({bytes} bytes); the row clears on the next list refresh.',
           fail: 'Not deleted: {error}'
         };
@@ -73,6 +75,7 @@ window.__ModuleLoader__.load({
                 data = await post('/api/session-cleaner/delete', { sessionId, withChildren: children.length > 0 });
               } catch (error) { fail(error); return; }
               if (!data?.ok) { fail(data?.error ?? '?'); return; }
+              if (data.queued) { ctx.contextMenus.notify(t('queued', { title }), true); return; }
               try { await ctx.sessions.refresh(); } catch { /* the row clears on the next refresh */ }
               let still = false;
               try { still = ctx.sessions.list.getSnapshot().ids.includes(sessionId); } catch { /* snapshot shape changed */ }

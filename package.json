@@ -1,5 +1,5 @@
 {
-  "name": "@local/dsh-session-cleaner", "version": "1.3.3", "private": true, "type": "module",
+  "name": "@local/dsh-session-cleaner", "version": "1.4.0", "private": true, "type": "module",
   "description": "Permanently delete an archived DSH session, with its child sessions when confirmed, from the sidebar.",
   "exports": {".": "./index.js", "./client": "./client.js", "./icon": "./icon.svg", "./locale/*.json": "./locale/*.json"},
   "files": ["index.js","client.js","core.cjs","host.cjs","bridge.cjs","assistant.cjs","清理助手.cmd","cordis.patch.yml","locale","icon.svg","README.md","LICENSE"],

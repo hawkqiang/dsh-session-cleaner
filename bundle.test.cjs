@@ -39,6 +39,13 @@ test('menu confirms the whole child tree before deleting it',{skip:process.platf
  assert.deepEqual(menu.calls.notify,[['done',true]]);
 });
 
+test('a busy session is queued for the next start instead of reported as deleted',{skip:process.platform!=='win32'},async()=>{
+ const menu=await loadMenu({deleteResult:{ok:true,queued:true,sessionId:'chosen',title:'K线优化测试',error:'该会话仍被 DSH 占用'}});
+ await menu.item().run();
+ assert.equal(menu.calls.refresh,0,'a queued row is still on disk, so the list is not refreshed');
+ assert.deepEqual(menu.calls.notify,[['queued',true]]);
+});
+
 test('menu reports a refused inspection and performs no deletion',{skip:process.platform!=='win32'},async()=>{
  const menu=await loadMenu({inspect:{ok:false,error:'该会话未归档'}});await menu.item().run();
  assert.deepEqual(menu.calls.posts.map(p=>p.url),['/api/session-cleaner/inspect']);

@@ -27,7 +27,7 @@ async function fixture(t) {
   const guard = path.join(base, 'epoch');
   await fs.writeFile(guard, crypto.randomUUID());
   const planDir = path.join(base, 'plans');
-  return { base, root, dir, file, snapshot, guard, planDir, sessionId: snapshot.header.id, snapshots: [snapshot], archived: true, archiveStateFile: guard };
+  return { base, root, dir, file, snapshot, guard, planDir, sessionId: snapshot.header.id, snapshots: [snapshot], archiveStateFile: guard };
 }
 
 async function gone(file) {
@@ -79,7 +79,6 @@ test('an unregistered page route reports the Host is not loaded', async () => {
       bind: namespace => key => tables[namespace]?.en?.[key] ?? key
     },
     contextMenus: { notify: (message, ok) => notes.push({ message, ok }), register: value => { menu = value; } },
-    workspaces: { list: { getSnapshot: () => ({ archivedSessionIds: [ID] }) } },
     sessions: { refresh: async () => {}, list: { getSnapshot: () => ({ ids: [] }) } }
   });
   sandbox.fetch = async () => ({ status: 404, text: async () => 'not found' });
@@ -118,8 +117,11 @@ test('the Host registers the same-origin route on POSIX and inspects a tree', { 
   module.apply({
     on() {},
     effect(fn) { const dispose = fn(); if (typeof dispose === 'function') disposers.push(dispose); },
-    workspaceRegistry: { archivedSessionIds: [parentId, childId] },
-    sessionPersistence: { list: async () => snapshots },
+    // Deliberately no workspace/archive service: deletion must not depend on it.
+    sessionPersistence: {
+      list: async () => (await Promise.all(snapshots.map(async snapshot => ({ snapshot, alive: await fs.lstat(snapshot.location.path).then(() => true, () => false) }))))
+        .filter(entry => entry.alive).map(entry => entry.snapshot)
+    },
     connection: { fetch: { register(route) { routes.set(route.path, route); return () => routes.delete(route.path); } } }
   });
   try {
@@ -127,7 +129,7 @@ test('the Host registers the same-origin route on POSIX and inspects a tree', { 
     const deadline = Date.now() + 8000;
     let ready = false;
     while (Date.now() < deadline) {
-      try { ready = (await fs.readFile(path.join(stateDir, 'host.log'), 'utf8')).includes('host started v1.5.0'); } catch {}
+      try { ready = (await fs.readFile(path.join(stateDir, 'host.log'), 'utf8')).includes('host started v1.6.0'); } catch {}
       if (ready) break;
       await new Promise(resolve => setTimeout(resolve, 40));
     }
@@ -142,6 +144,16 @@ test('the Host registers the same-origin route on POSIX and inspects a tree', { 
     assert.equal(body.ok, true);
     assert.equal(body.title, '父会话');
     assert.equal(body.children.length, 1);
+    // The same row deletes without ever being archived.
+    const remove = routes.get('/api/session-cleaner/delete');
+    assert.ok(remove, 'delete route should be registered');
+    const deleted = await (await remove.fetch(new Request('http://127.0.0.1/api/session-cleaner/delete', {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ sessionId: parentId, withChildren: true })
+    }))).json();
+    assert.equal(deleted.ok, true);
+    assert.equal(deleted.deleted, 2);
+    await assert.rejects(fs.lstat(path.join(parentDir, 'session.v4.jsonl')), { code: 'ENOENT' });
+    await assert.rejects(fs.lstat(path.join(childDir, 'session.v4.jsonl')), { code: 'ENOENT' });
   } finally {
     for (const dispose of disposers.reverse()) { try { await dispose(); } catch {} }
     if (previousHome === undefined) delete process.env.HOME; else process.env.HOME = previousHome;

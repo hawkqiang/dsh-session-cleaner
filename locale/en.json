@@ -1,1 +1,1 @@
-{"meta":{"title":"Session cleaner","description":"Delete an archived session log from its sidebar row and refresh the list. Child sessions are listed and removed only after you confirm. The Host holds the same writer lock DSH uses."}}
+{"meta":{"title":"Session cleaner","description":"Delete a session log from its sidebar row and refresh the list; archiving is not required. Child sessions are listed and removed only after you confirm. The Host holds the same writer lock DSH uses."}}

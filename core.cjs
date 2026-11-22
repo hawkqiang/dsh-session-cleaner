@@ -1,6 +1,7 @@
 'use strict';
 // Offline maintenance for the JSONL provider shipped in DSH 0.2.2-rc.5.
-// Not a generic file remover. All roots, archive and snapshot facts come from the Host.
+// Not a generic file remover. Roots and snapshot facts come from the Host; whether the
+// user archived a session is a workspace decision, not a filesystem precondition.
 // Windows keeps the exclusive handle plus named-semaphore path; POSIX (Linux, Android
 // Termux, macOS) arbitrates on the same `flock(2)` DSH itself takes on session.lock.
 const fs = require('node:fs/promises');
@@ -22,8 +23,8 @@ function rootPath(p){if(typeof p!=='string'||!path.isAbsolute(p)||path.resolve(p
 async function checkDir(p){rootPath(p);for(let q=p;;q=path.dirname(q)){const s=await fs.lstat(q);if(!s.isDirectory()||s.isSymbolicLink())fail('Unexpected directory type');if(q===path.dirname(q))break}const real=await fs.realpath(p);if(WIN32?path.normalize(real).toLowerCase()!==p.toLowerCase():real!==p)fail('Redirected directory');}
 async function oneFile(f){await checkDir(path.dirname(f));const s=await fs.lstat(f,{bigint:true});if(!s.isFile()||s.isSymbolicLink()||s.nlink!==1n||s.size>BigInt(Number.MAX_SAFE_INTEGER))fail('Expected a single-link regular file');return [String(s.dev),String(s.ino),String(s.size),String(s.mtimeNs),String(s.ctimeNs)]}
 async function digest(f){const h=await fs.open(f,'r');try{const s=await h.stat({bigint:true});if(!s.isFile()||s.nlink!==1n)fail('Unsafe log');const sum=crypto.createHash('sha256');for await(const chunk of h.createReadStream({autoClose:false}))sum.update(chunk);return sum.digest('hex')}finally{await h.close()}}
-function admit({sessionId,archived,snapshots,allowTree=false}){
- if(!simpleId(sessionId)||archived!==true||!Array.isArray(snapshots))fail('Archived session with verified provider inventory required');
+function admit({sessionId,snapshots,allowTree=false}){
+ if(!simpleId(sessionId)||!Array.isArray(snapshots))fail('Session with verified provider inventory required');
  const seen=new Set();let target;for(const s of snapshots){const h=s?.header;if(!h||typeof h.id!=='string'||seen.has(h.id)||h.version!==4)fail('Incomplete or ambiguous provider inventory');seen.add(h.id);if(!allowTree&&h.parentSession===sessionId)fail('Session has child sessions');if(h.id===sessionId)target=s}
  const h=target?.header;
  if(!h||target.formatStatus!=='current'||target.location?.kind!=='jsonl')fail('Only independent current-format JSONL sessions qualify');
@@ -62,8 +63,8 @@ async function singleGeneration(f){const a=(await fs.readdir(path.dirname(f))).f
 async function privateDir(d,root,create){rootPath(d);rootPath(root);for(const [a,b] of [[d,root],[root,d]]){const rel=path.relative(a,b);if(rel===''||(!rel.startsWith('..'+path.sep)&&rel!=='..'&&!path.isAbsolute(rel)))fail('Plan directory must be separate from store')}if(create){await checkDir(path.dirname(d));await fs.mkdir(d,{mode:0o700}).catch(e=>{if(e.code!=='EEXIST')throw e})}await checkDir(d)}
 async function keyAt(d,create){const f=path.join(d,'plan-auth.key');if(create){try{await fs.writeFile(f,crypto.randomBytes(32),{flag:'wx',mode:0o600})}catch(e){if(e.code!=='EEXIST')throw e}}await oneFile(f);const k=await fs.readFile(f);if(k.length!==32)fail('Bad local plan key');return k}
 function mac(k,p){return crypto.createHmac('sha256',k).update(JSON.stringify(p)).digest('hex')}
-async function preparePlan({root,sessionId,archived,snapshots,planDir,archiveStateFile,allowTree=false}){
- const epoch=rootPath(archiveStateFile),epochSig=await oneFile(epoch);const s=admit({sessionId,archived,snapshots,allowTree});const f=s.location.path;const rel=location(root,f,sessionId);const cs=await census(root,snapshots);const sig=await singleGeneration(f);const sha=await digest(f);if(JSON.stringify(sig)!==JSON.stringify(await singleGeneration(f))||Number(sig[2])!==s.sizeBytes||cs!==await census(root))fail('Storage changed during planning');
+async function preparePlan({root,sessionId,snapshots,planDir,archiveStateFile,allowTree=false}){
+ const epoch=rootPath(archiveStateFile),epochSig=await oneFile(epoch);const s=admit({sessionId,snapshots,allowTree});const f=s.location.path;const rel=location(root,f,sessionId);const cs=await census(root,snapshots);const sig=await singleGeneration(f);const sha=await digest(f);if(JSON.stringify(sig)!==JSON.stringify(await singleGeneration(f))||Number(sig[2])!==s.sizeBytes||cs!==await census(root))fail('Storage changed during planning');
  const planId=crypto.randomUUID(),p={version:1,planId,sessionId,root,rel,created:Date.now(),sig,sha,census:cs};p.archiveStateFile=epoch;p.archiveSig=epochSig;if(JSON.stringify(epochSig)!==JSON.stringify(await oneFile(epoch)))fail('Archive state changed during planning');
  await privateDir(planDir,root,true);const k=await keyAt(planDir,true);await fs.writeFile(path.join(planDir,planId+'.json'),JSON.stringify({p,auth:mac(k,p)}),{mode:0o600,flag:'wx'});return {planId,sessionId,bytes:Number(sig[2])};
 }

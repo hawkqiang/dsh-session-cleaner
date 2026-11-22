@@ -1,5 +1,5 @@
 'use strict';
-// Host-side deletion for archived sessions. Kept free of cordis so the exact path
+// Host-side deletion for materialized sessions. Kept free of cordis so the exact path
 // used by the HTTP route can be exercised on synthetic stores.
 const fs = require('node:fs/promises');
 const path = require('node:path');
@@ -56,7 +56,7 @@ function describeTree({sessionId, snapshots}) {
 
 async function removeOne({sessionId, snapshots, planDir, guard, core, allowTree}) {
   const {target, file, root} = pickTarget({sessionId, snapshots});
-  const plan = await core.preparePlan({root, sessionId, archived: true, snapshots, planDir, archiveStateFile: guard, allowTree});
+  const plan = await core.preparePlan({root, sessionId, snapshots, planDir, archiveStateFile: guard, allowTree});
   const done = await core.executePlan({root, planDir, planId: plan.planId, sessionId, liveConfirmed: true});
   try { await fs.stat(file); throw Error('删除后日志仍然存在'); } catch (error) { if (error.code !== 'ENOENT') throw error; }
   return {bytes: Number(done.bytes) || 0};
@@ -80,10 +80,10 @@ async function removeTree({sessionId, snapshots, planDir, guard, core, withChild
   const ids = [...members.map(s => s.header.id), sessionId];
   let total = 0;
   for (const id of ids) {
-    if (typeof stillValid === 'function' && !stillValid()) throw Error('归档状态已变化，请重试');
+    if (typeof stillValid === 'function' && !stillValid()) throw Error('会话状态已变化，请重试');
     let result;
     for (let attempt = 1; ; attempt += 1) {
-      if (typeof stillValid === 'function' && !stillValid()) throw Error('归档状态已变化，请重试');
+      if (typeof stillValid === 'function' && !stillValid()) throw Error('会话状态已变化，请重试');
       const current = typeof list === 'function' ? await list() : snapshots;
       try {
         result = await removeOne({sessionId: id, snapshots: current, planDir, guard, core, allowTree: members.length > 0});

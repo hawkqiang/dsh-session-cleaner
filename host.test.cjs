@@ -88,7 +88,7 @@ test('host path deletes children before the parent when a cascade is confirmed',
  for(const snapshot of a.snapshots)await assert.rejects(fs.stat(snapshot.location.path),{code:'ENOENT'});
 });
 
-test('host path refuses an archived session that is missing from the provider snapshot', async t=>{
+test('host path refuses a session that is missing from the provider snapshot', async t=>{
  const a=await fixture(t);
  await assert.rejects(removeTree({...a,list:undefined,snapshots:[{...a.snapshots[0],header:{...a.snapshots[0].header,id:'other'}}]}),/JSONL/);
  assert.equal(await fs.readFile(a.snapshots[0].location.path,'utf8'),'synthetic-log');
@@ -96,7 +96,7 @@ test('host path refuses an archived session that is missing from the provider sn
 
 test('host path refuses a stale archive state observed before deletion', async t=>{
  const a=await fixture(t);
- await assert.rejects(removeTree({...a,stillValid:()=>false}),/归档状态已变化/);
+ await assert.rejects(removeTree({...a,stillValid:()=>false}),/会话状态已变化/);
  assert.equal(await fs.readFile(a.snapshots[0].location.path,'utf8'),'synthetic-log');
 });
 

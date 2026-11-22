@@ -27,15 +27,14 @@ window.__ModuleLoader__.load({
       return data;
     };
     return {
-      inject: ['contextMenus', 'workspaces', 'sessions', 'locale'],
+      inject: ['contextMenus', 'sessions', 'locale'],
       apply(ctx) {
         const ns = 'localSessionCleaner';
         const zh = {
           menu: '永久删除…',
-          need: '请先归档这条会话；删除只对已归档会话生效。',
           untitled: '无标题',
-          confirm: '永久删除「{title}」？\n\n会话 ID：{id}\n日志 {bytes} 字节，不进回收站，无法恢复。',
-          confirmTree: '「{title}」有 {count} 个子会话，删除父会话会连同它们一起永久删除：\n\n{list}\n\n删除后均无法恢复，确认吗？',
+          confirm: '永久删除「{title}」？\n\n会话 ID：{id}\n日志 {bytes} 字节，不进回收站，无法恢复。\n\n若该会话仍被 DSH 占用（例如正打开着），会自动排队到下次启动 DSH 时删除。',
+          confirmTree: '「{title}」有 {count} 个子会话，删除父会话会连同它们一起永久删除：\n\n{list}\n\n删除后均无法恢复，确认吗？\n\n若该会话仍被 DSH 占用，会自动排队到下次启动 DSH 时删除。',
           subagentHint: '（子代理）',
           more: '…另外还有 {count} 个',
           done: '已永久删除「{title}」，移除 {deleted} 份日志、{bytes} 字节。',
@@ -45,10 +44,9 @@ window.__ModuleLoader__.load({
         };
         const en = {
           menu: 'Delete permanently…',
-          need: 'Archive this session first; deletion only applies to archived sessions.',
           untitled: 'Untitled',
-          confirm: 'Permanently delete "{title}"?\n\nSession ID: {id}\n{bytes} bytes of session log. It does not go to the Recycle Bin and cannot be undone.',
-          confirmTree: '"{title}" has {count} child sessions. Deleting it also permanently deletes:\n\n{list}\n\nNone of this can be undone. Continue?',
+          confirm: 'Permanently delete "{title}"?\n\nSession ID: {id}\n{bytes} bytes of session log. It does not go to the Recycle Bin and cannot be undone.\n\nIf DSH still holds it (for example it is open), the deletion is queued until the next DSH start.',
+          confirmTree: '"{title}" has {count} child sessions. Deleting it also permanently deletes:\n\n{list}\n\nNone of this can be undone. Continue?\n\nIf DSH still holds it, the deletion is queued until the next DSH start.',
           subagentHint: ' (subagent)',
           more: '…and {count} more',
           done: 'Permanently deleted "{title}"; {deleted} logs and {bytes} bytes removed.',
@@ -64,12 +62,10 @@ window.__ModuleLoader__.load({
           id: 'local-session-cleaner.delete',
           target: 'session',
           order: 650,
-          observe: () => [ctx.workspaces.list, ctx.locale],
+          observe: () => [ctx.locale],
           resolve: ({ sessionId, displayTitle }) => [{
             id: 'delete', label: t('menu'), failureLabel: t('fail', { error: '?' }), afterContent: true,
             run: async () => {
-              const archived = ctx.workspaces.list.getSnapshot().archivedSessionIds;
-              if (!archived.includes(sessionId)) { ctx.contextMenus.notify(t('need'), false); return; }
               const title = clean(displayTitle) || t('untitled');
               const id = clean(sessionId);
               let info;

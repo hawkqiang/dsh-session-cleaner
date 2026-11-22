@@ -5,10 +5,10 @@ import bridge from './bridge.cjs';
 import core from './core.cjs';
 import host from './host.cjs';
 
-export const inject=['workspaceRegistry','sessionPersistence','connection'];
+export const inject=['sessionPersistence','connection'];
 // Bump together with package.json. The startup line in host.log proves which
 // Host code the running DSH actually loaded.
-const VERSION='1.5.0';
+const VERSION='1.6.0';
 const PLATFORMS=new Set(['win32','linux','darwin','android']);
 export function apply(ctx){
   if(!PLATFORMS.has(process.platform))return;
@@ -29,26 +29,25 @@ export function apply(ctx){
   async function invalidate(){revision++;if(!guard)return;const tmp=guard+'.'+randomUUID();try{await fs.writeFile(tmp,randomUUID(),{flag:'wx',mode:0o600});await fs.rename(tmp,guard);}catch(e){failed=true;throw e;}finally{await fs.unlink(tmp).catch(()=>{});}}
   ctx.on('workspace/session-unarchiving',invalidate);
 
-  const archived=id=>ctx.workspaceRegistry.archivedSessionIds.includes(id);
-
   // Inspect the verified target and its descendant tree before the page asks for
   // confirmation, so the dialog can name what a cascade removal would destroy.
-  async function inspectArchived(sessionId){
+  // Archiving is not a precondition: any materialized session can be deleted, and an
+  // open one refuses through the writer lock and gets queued instead.
+  async function inspectSession(sessionId){
     if(failed||disposed||!planDir||!guard)throw Error('插件尚未就绪，请重开 DSH');
-    if(!archived(sessionId))throw Error('该会话未归档，删除只对已归档会话生效');
     return host.describeTree({sessionId,snapshots:await ctx.sessionPersistence.list()});
   }
 
-  // Verify the provider snapshot, plan, delete with the writer semaphore held, then
-  // prove every log is gone. Shared by the page route and the external assistant.
-  async function deleteArchived(sessionId,withChildren){
+  // Verify the provider snapshot, plan, delete with the writer lock held, then prove
+  // every log is gone. Shared by the page route and the external assistant.
+  async function deleteSession(sessionId,withChildren){
     if(failed||disposed||!planDir||!guard)throw Error('插件尚未就绪，请重开 DSH');
-    if(!archived(sessionId))throw Error('该会话未归档，已拒绝删除');
     const snapshots=await ctx.sessionPersistence.list();
     const at=revision;
+    const listed=new Set(snapshots.map(s=>s?.header?.id).filter(id=>typeof id==='string'));
     return host.removeTree({sessionId,snapshots,planDir,guard,core,withChildren,
       list:()=>ctx.sessionPersistence.list(),
-      stillValid:()=>!disposed&&!failed&&at===revision&&archived(sessionId)});
+      stillValid:()=>!disposed&&!failed&&at===revision&&listed.has(sessionId)});
   }
 
   // Same-origin page routes: the browser reaches them through DSH's authenticated
@@ -62,7 +61,7 @@ export function apply(ctx){
       fetch:async request=>{
         let body;try{body=await request.json();}catch{return Response.json({ok:false,error:'请求格式错误'},{status:400});}
         if(!readId(body))return Response.json({ok:false,error:'无效的会话 ID'},{status:400});
-        try{return Response.json({ok:true,...await inspectArchived(body.sessionId)});}
+        try{return Response.json({ok:true,...await inspectSession(body.sessionId)});}
         catch(e){const message=String(e?.message??e).slice(0,300);await note(`inspect ${body.sessionId} refused: ${message}`);return Response.json({ok:false,error:message});}
       }
     });
@@ -73,14 +72,14 @@ export function apply(ctx){
       fetch:async request=>{
         let body;try{body=await request.json();}catch{return Response.json({ok:false,error:'请求格式错误'},{status:400});}
         if(!readId(body))return Response.json({ok:false,error:'无效的会话 ID'},{status:400});
-        try{return Response.json({ok:true,...await deleteArchived(body.sessionId,body.withChildren===true)});}
+        try{return Response.json({ok:true,...await deleteSession(body.sessionId,body.withChildren===true)});}
         catch(e){
           const message=String(e?.message??e).slice(0,300);await note(`delete ${body.sessionId} failed: ${message}`);
           // DSH itself keeps a write handle on loaded sessions; queue instead of failing
           // outright, and retry on the next Host start when the lock is gone.
           if(/被 DSH 占用|正被其他程序打开|still active|being used by another process/i.test(message)){
             try{
-              let title;try{title=(await inspectArchived(body.sessionId)).title}catch{}
+              let title;try{title=(await inspectSession(body.sessionId)).title}catch{}
               const queued=await host.enqueuePending(planDir,body.sessionId,title);
               await note(`delete ${body.sessionId} queued (${queued} pending)`);
               return Response.json({ok:true,queued:true,sessionId:body.sessionId,title,error:message});
@@ -102,13 +101,13 @@ export function apply(ctx){
       guard=path.join(base,'archive-epoch-'+key);await invalidate();if(disposed)return;
       await note(`host started v${VERSION} profile=${path.basename(profile)} pid=${process.pid}`);
       const halt=await bridge.start(async(sessionId)=>{
-        if(disposed||!archived(sessionId))throw Error('该会话未归档，或插件状态已变化。');
+        if(disposed)throw Error('插件状态已变化，请重开 DSH 后重试。');
         const snapshots=await ctx.sessionPersistence.list();const target=snapshots.find(x=>x.header?.id===sessionId);
         if(!target||target.location?.kind!=='jsonl')throw Error('找不到受支持的 JSONL 会话');
         const file=target.location.path,root=path.dirname(path.dirname(path.dirname(file)));
         if(snapshots.some(s=>s.location?.kind!=='jsonl'||typeof s.location?.path!=='string'||path.dirname(path.dirname(path.dirname(s.location.path)))!==root))throw Error('无法验证统一的存储边界');
-        const result=await core.preparePlan({root,planDir,sessionId,archived:true,snapshots,archiveStateFile:guard});
-        if(disposed||failed||!archived(sessionId))throw Error('预览期间归档状态发生变化，请重新生成计划。');
+        const result=await core.preparePlan({root,planDir,sessionId,snapshots,archiveStateFile:guard});
+        if(disposed||failed)throw Error('预览期间插件状态发生变化，请重新生成计划。');
         return {...result,planDir,root};
       });if(disposed)halt();else stop=halt;
       // Finish queued deletions now: at startup the sessions DSH had loaded are not
@@ -119,7 +118,6 @@ export function apply(ctx){
             list:()=>ctx.sessionPersistence.list(),
             log:note,
             attempt:async sessionId=>{
-              if(!archived(sessionId))throw Error('该会话未归档');
               const snapshots=await ctx.sessionPersistence.list();
               return host.removeTree({sessionId,snapshots,planDir,guard,core,withChildren:false,
                 list:()=>ctx.sessionPersistence.list(),attempts:1});

@@ -42,7 +42,7 @@ async function main(){
   const rl=createInterface({input:stdin,output:stdout});
   try{
     const guess=clipboardId();
-    console.log('清理单个已归档会话 · 预览阶段不删除。');
+    console.log('清理单个会话 · 无需归档 · 预览阶段不删除。');
     if(guess)console.log(`剪贴板中的会话 ID：${guess}`);
     const answer=(await rl.question(guess?'直接回车使用上面的 ID，或粘贴另一个（回车取消）：':'粘贴会话 ID（回车取消）：')).trim();
     const id=answer||guess;

@@ -7,6 +7,7 @@ const uuid = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/;
 const sid = /^[A-Za-z0-9_-]{1,160}$/;
 async function safeDir(d) {
   if (typeof d !== 'string' || !path.isAbsolute(d) || path.resolve(d) !== d) throw Error('需要本机绝对目录');
+  if (process.platform === 'win32' && !/^[A-Za-z]:\\/.test(d)) throw Error('需要本机绝对目录');
   for(let p=d;;p=path.dirname(p)) {const s=await fs.lstat(p); if(!s.isDirectory() || s.isSymbolicLink()) throw Error('不接受重定向目录'); if(p===path.dirname(p)) break;}
   const real=await fs.realpath(d);
   if(process.platform==='win32'? real.toLowerCase()!==d.toLowerCase() : real!==d) throw Error('目录位置不匹配');

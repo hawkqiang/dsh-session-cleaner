@@ -1,16 +1,25 @@
 'use strict';
-// Offline maintenance for the Windows JSONL provider shipped in DSH 0.2.2-rc.5.
+// Offline maintenance for the JSONL provider shipped in DSH 0.2.2-rc.5.
 // Not a generic file remover. All roots, archive and snapshot facts come from the Host.
+// Windows keeps the exclusive handle plus named-semaphore path; POSIX (Linux, Android
+// Termux, macOS) arbitrates on the same `flock(2)` DSH itself takes on session.lock.
 const fs = require('node:fs/promises');
+const fsc = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
 const {spawn} = require('node:child_process');
+const {createRequire} = require('node:module');
+const {pathToFileURL} = require('node:url');
 const TTL=10*60*1000;
+const WIN32=process.platform==='win32';
+// The JSONL provider keeps one zero-length lock file beside every materialized log on
+// POSIX; it is expected storage, not a stray artifact.
+const LOCK='session.lock';
 const fail=m=>{throw Error(m)};
 const hash=x=>crypto.createHash('sha256').update(x).digest('hex');
 function simpleId(s){return typeof s==='string' && /^[A-Za-z0-9_-]{1,160}$/.test(s) && !/^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])$/i.test(s)}
 function rootPath(p){if(typeof p!=='string'||!path.isAbsolute(p)||path.resolve(p)!==p||path.parse(p).root===p|| (process.platform==='win32' && (!/^[A-Za-z]:\\/.test(p)||/[\x00-\x1f<>:"|?*]/.test(p.slice(2))||p.slice(3).split('\\').some(x=>/[. ]$/.test(x)))))fail('Expected canonical absolute local path');return p}
-async function checkDir(p){rootPath(p);for(let q=p;;q=path.dirname(q)){const s=await fs.lstat(q);if(!s.isDirectory()||s.isSymbolicLink())fail('Unexpected directory type');if(q===path.dirname(q))break}if(path.normalize(await fs.realpath(p)).toLowerCase()!==p.toLowerCase())fail('Redirected directory');}
+async function checkDir(p){rootPath(p);for(let q=p;;q=path.dirname(q)){const s=await fs.lstat(q);if(!s.isDirectory()||s.isSymbolicLink())fail('Unexpected directory type');if(q===path.dirname(q))break}const real=await fs.realpath(p);if(WIN32?real.toLowerCase()!==p.toLowerCase():real!==p)fail('Redirected directory');}
 async function oneFile(f){await checkDir(path.dirname(f));const s=await fs.lstat(f,{bigint:true});if(!s.isFile()||s.isSymbolicLink()||s.nlink!==1n||s.size>BigInt(Number.MAX_SAFE_INTEGER))fail('Expected a single-link regular file');return [String(s.dev),String(s.ino),String(s.size),String(s.mtimeNs),String(s.ctimeNs)]}
 async function digest(f){const h=await fs.open(f,'r');try{const s=await h.stat({bigint:true});if(!s.isFile()||s.nlink!==1n)fail('Unsafe log');const sum=crypto.createHash('sha256');for await(const chunk of h.createReadStream({autoClose:false}))sum.update(chunk);return sum.digest('hex')}finally{await h.close()}}
 function admit({sessionId,archived,snapshots,allowTree=false}){
@@ -36,6 +45,7 @@ async function census(root,snapshots){
    if(!session.isDirectory()||session.isSymbolicLink())fail('Unexpected project entry');
    const dir=path.join(d,session.name);await checkDir(dir);const generations=[];
    for(const file of await fs.readdir(dir,{withFileTypes:true})){
+    if(file.name===LOCK){if(!file.isFile()||file.isSymbolicLink())fail('Unexpected session lock entry');continue}
     const m=/^session(?:\.v([1-9]\d*))?\.jsonl(?:\.zstd)?$/.exec(file.name);
     if(!file.isFile()||file.isSymbolicLink()||!m)fail('Unexpected session-local artifacts in storage inventory');
     const version=Number(m[1]??0);if(!Number.isSafeInteger(version)||generations.some(g=>g.version===version))fail('Unknown or ambiguous storage generation');
@@ -48,7 +58,7 @@ async function census(root,snapshots){
  if(snapshots){for(const s of snapshots){if(s.location?.kind!=='jsonl'||!selected.delete(s.location.path))fail('Provider and filesystem inventory mismatch')}if(selected.size)fail('Provider omitted a physical session');}
  return hash(rows.sort().join('\n'));
 }
-async function singleGeneration(f){const a=await fs.readdir(path.dirname(f));if(a.length!==1||a[0]!==path.basename(f))fail('Refusing multiple generations or unexpected session-local artifacts');return oneFile(f)}
+async function singleGeneration(f){const a=(await fs.readdir(path.dirname(f))).filter(n=>n!==LOCK);if(a.length!==1||a[0]!==path.basename(f))fail('Refusing multiple generations or unexpected session-local artifacts');return oneFile(f)}
 async function privateDir(d,root,create){rootPath(d);rootPath(root);for(const [a,b] of [[d,root],[root,d]]){const rel=path.relative(a,b);if(rel===''||(!rel.startsWith('..'+path.sep)&&rel!=='..'&&!path.isAbsolute(rel)))fail('Plan directory must be separate from store')}if(create){await checkDir(path.dirname(d));await fs.mkdir(d,{mode:0o700}).catch(e=>{if(e.code!=='EEXIST')throw e})}await checkDir(d)}
 async function keyAt(d,create){const f=path.join(d,'plan-auth.key');if(create){try{await fs.writeFile(f,crypto.randomBytes(32),{flag:'wx',mode:0o600})}catch(e){if(e.code!=='EEXIST')throw e}}await oneFile(f);const k=await fs.readFile(f);if(k.length!==32)fail('Bad local plan key');return k}
 function mac(k,p){return crypto.createHmac('sha256',k).update(JSON.stringify(p)).digest('hex')}
@@ -155,27 +165,200 @@ async function runNative(script,env){
   if(code!==0){const detail=await fs.readFile(errFile,'utf8').catch(()=>'');fail(explain(detail));}
  }finally{await fs.unlink(errFile).catch(()=>{});}
 }
-async function executePlan(opts){
+// ---------------------------------------------------------------------------
+// POSIX (Linux, Android Termux, macOS) deletion.
+// DSH arbitrates a session's writers with a non-blocking flock(2) on session.lock,
+// so this path takes the same lock, then verifies the log through an O_NOFOLLOW
+// descriptor before unlinking it. The lock file lives in the session directory and
+// is expected storage, not a stray artifact.
+
+const BUSY='该会话仍被 DSH 占用：请先切到其他对话让它关闭后再试，或完全退出 DSH 后重试';
+function busyError(){return Error(BUSY)}
+function isContention(error){return error?.code==='EAGAIN'||error?.code==='EWOULDBLOCK'}
+// The native flock entry ships inside the running DSH installation. Resolve it from
+// the DSH process itself (argv[1] or the runtime beside DSH_NODE_EXECUTABLE) so the
+// plugin does not need its own copy of the addon.
+function addonRoots(){
+  const out=[];
+  const add=value=>{if(typeof value==='string'&&path.isAbsolute(value)&&!out.includes(value))out.push(value)};
+  add(process.argv[1]);
+  const node=process.env.DSH_NODE_EXECUTABLE||process.execPath;
+  if(typeof node==='string'&&path.isAbsolute(node)){
+    add(path.join(path.dirname(node),'..','work','node_modules','@deepseek-ai','dsh-session-persistence-jsonl','lib','index.js'));
+    add(path.join(path.dirname(node),'..','..','work','node_modules','@deepseek-ai','dsh-session-persistence-jsonl','lib','index.js'));
+  }
+  add(require.main?.filename);
+  add(__filename);
+  return out;
+}
+let flockProbe;
+async function flockEntry(){
+  if(flockProbe!==undefined)return flockProbe;
+  flockProbe=null;
+  for(const base of addonRoots()){
+    try{
+      const req=createRequire(base);
+      const resolved=req.resolve('@deepseek-ai/node-addon-system/flock');
+      const mod=await import(pathToFileURL(resolved).href);
+      if(typeof mod.tryLockExclusive==='function'){flockProbe=mod.tryLockExclusive;break}
+    }catch{/* another root, or the flock(1) fallback below */}
+  }
+  return flockProbe;
+}
+function flockBinary(){
+  const explicit=String(process.env.DSH_SESSION_CLEANER_FLOCK||'').trim();
+  const candidates=[explicit];
+  for(const dir of String(process.env.PATH||'').split(':'))if(dir)candidates.push(path.join(dir,'flock'));
+  candidates.push('/data/data/com.termux/files/usr/glibc/bin/flock','/data/data/com.termux/files/usr/bin/flock','/usr/bin/flock','/bin/flock');
+  for(const candidate of candidates){
+    if(!candidate||!path.isAbsolute(candidate))continue;
+    try{const s=fsc.statSync(candidate);if(s.isFile()&&fsc.accessSync(candidate,fsc.constants.X_OK)===undefined)return candidate}catch{}
+  }
+  return undefined;
+}
+// Fallback arbitration when the addon is unavailable: keep a flock(1) holder alive
+// for the duration of the verification and unlink.
+async function holdWithCli(bin,lockPath){
+  const child=spawn(bin,['-n',lockPath,'sleep','86400'],{stdio:['ignore','ignore','pipe'],windowsHide:true});
+  let detail='';
+  child.stderr.on('data',chunk=>{detail+=chunk});
+  const exited=new Promise(resolve=>child.once('exit',(code,signal)=>resolve({code,signal})));
+  const raced=await Promise.race([exited,new Promise(resolve=>setTimeout(()=>resolve(undefined),150))]);
+  if(raced){
+    if(raced.code===1)throw busyError();
+    throw Error(`flock 启动失败：${detail.trim()||`退出码 ${raced.code}`}`);
+  }
+  return ()=>{try{child.kill('SIGTERM')}catch{/* already gone */}};
+}
+async function acquireWriteLock(dir){
+  const lockPath=path.join(dir,LOCK);
+  for(let attempt=0;attempt<3;attempt+=1){
+    let handle;
+    try{handle=await fs.open(lockPath,'w',0o600);}
+    catch(error){throw Error(`无法打开会话锁：${error?.code||error?.message||error}`)}
+    let release;
+    try{
+      const native=await flockEntry();
+      let held=false;
+      if(native){
+        try{await native(handle.fd);held=true;}
+        catch(error){
+          if(isContention(error))throw busyError();
+          if(error?.code!=='ERR_FLOCK_UNSUPPORTED_PLATFORM')throw error;
+        }
+      }
+      if(!held){
+        const bin=flockBinary();
+        if(!bin)throw Error('没有可用的 flock 实现，已拒绝删除');
+        release=await holdWithCli(bin,lockPath);
+      }
+      // A POSIX lock names an inode, not a path: the locked file must still be the
+      // one reachable at the lock path.
+      const locked=await handle.stat({bigint:true});
+      const current=await fs.stat(lockPath,{bigint:true}).catch(error=>{if(error?.code==='ENOENT')return undefined;throw error});
+      if(!current||current.dev!==locked.dev||current.ino!==locked.ino){
+        release?.();await handle.close().catch(()=>{});
+        continue;
+      }
+      return {release:async()=>{release?.();await handle.close().catch(()=>{})}};
+    }catch(error){release?.();await handle.close().catch(()=>{});throw error}
+  }
+  throw busyError();
+}
+function unlinkHusk(dir){
+  return fs.readdir(dir).then(async left=>{
+    if(left.length!==1||left[0]!==LOCK)return false;
+    const lock=path.join(dir,LOCK);
+    const st=await fs.lstat(lock,{bigint:true});
+    if(!st.isFile()||st.nlink!==1n)return false;
+    await fs.unlink(lock);
+    await fs.rmdir(dir);
+    return true;
+  });
+}
+// Called only while the write lock is held. Verifies identity and content through
+// a descriptor that refuses symlinks and hardlinks, then unlinks the directory entry.
+async function removeUnderLock(file,sha){
+  const dir=path.dirname(file),base=path.basename(file);
+  await checkDir(dir);
+  const entries=(await fs.readdir(dir)).filter(name=>name!==LOCK);
+  if(entries.length!==1||entries[0]!==base)fail('Refusing multiple generations or unexpected session-local artifacts');
+  const O=fsc.constants.O_RDONLY|fsc.constants.O_NOFOLLOW;
+  let handle;
+  try{handle=await fs.open(file,O);}
+  catch(error){if(error?.code==='ENOENT')fail('Log already gone');fail(`无法打开日志：${error?.code||error?.message||error}`)}
+  try{
+    const st=await handle.stat({bigint:true});
+    if(!st.isFile()||st.nlink!==1n)fail('Expected a single-link regular file');
+    if(typeof sha!=='string'||!/^[0-9a-f]{64}$/.test(sha))fail('Invalid content hash');
+    const sum=crypto.createHash('sha256');
+    const stream=handle.createReadStream({autoClose:false,start:0});
+    for await(const chunk of stream)sum.update(chunk);
+    if(sum.digest('hex')!==sha)fail('Log content changed since preview');
+    const current=await fs.lstat(file,{bigint:true}).catch(error=>{if(error?.code==='ENOENT')return undefined;throw error});
+    if(!current||current.isSymbolicLink()||current.dev!==st.dev||current.ino!==st.ino)fail('Log entry changed during verification');
+    const result={dev:String(st.dev),ino:String(st.ino),size:String(st.size),dir};
+    await fs.unlink(file);
+    const gone=await fs.lstat(file).then(()=>false,error=>{if(error?.code==='ENOENT')return true;throw error});
+    if(!gone)fail('删除后日志仍然存在');
+    return result;
+  }finally{await handle.close().catch(()=>{})}
+}
+async function dropHusk(dir){try{return await unlinkHusk(dir)}catch{return false}}
+
+async function executeWin32Plan(opts){
   if(opts.offlineConfirmed!==true&&opts.liveConfirmed!==true)fail('Explicit confirmation required');
-  if(process.platform!=='win32')fail('Windows only');
-  const {f,p}=await loadPlan(opts);const lease='Local\\dsh-session-lock-'+hash(path.resolve(path.dirname(f),'session.lock').toLowerCase());
+  if(!WIN32)fail('Windows only');
+  const {f,p}=await loadPlan(opts);const lease='Local\\dsh-session-lock-'+hash(path.resolve(path.dirname(f),LOCK).toLowerCase());
   await runNative(composeNative(opts.liveConfirmed!==true),{CLEANER_FILE:f,CLEANER_SHA:p.sha,CLEANER_LEASE:lease,CLEANER_PID:String(process.pid)});
   return {sessionId:p.sessionId,bytes:Number(p.sig[2]),deletedFiles:1};
 }
-module.exports={preparePlan,executePlan,inspectPlan:loadPlan,removeVerified,explain,composeNative};
+async function executePosixPlan(opts){
+  if(opts.offlineConfirmed!==true&&opts.liveConfirmed!==true)fail('Explicit confirmation required');
+  if(WIN32)fail('POSIX only');
+  const {f,p}=await loadPlan(opts);
+  const lease=await acquireWriteLock(path.dirname(f));
+  try{
+    // The plan was signed before arbitration; take the writer lock first, then prove
+    // the bytes on disk are still the ones the user previewed.
+    const entries=(await fs.readdir(path.dirname(f))).filter(name=>name!==LOCK);
+    if(entries.length!==1||entries[0]!==path.basename(f))fail('Refusing multiple generations or unexpected session-local artifacts');
+    if(JSON.stringify(await oneFile(f))!==JSON.stringify(p.sig))fail('Log content changed since preview');
+    const done=await removeUnderLock(f,p.sha);
+    if(done.dev!==p.sig[0]||done.ino!==p.sig[1]||done.size!==p.sig[2])fail('Log identity changed since preview');
+    await dropHusk(done.dir);
+    return {sessionId:p.sessionId,bytes:Number(done.size),deletedFiles:1};
+  }finally{await lease.release();}
+}
+async function executePlan(opts){return WIN32?executeWin32Plan(opts):executePosixPlan(opts);}
 
 // Delete one already-previewed log by its verified content hash. Used when the
 // signed plan expired or lost its archive epoch: the hash still proves the bytes
-// are the ones the user previewed. Live mode keeps the writer semaphore and the
-// exclusive handle, so an active writer or an open reader still refuses.
-async function removeVerified({file,sha,liveConfirmed}){
+// are the ones the user previewed. Live mode keeps the writer arbitration, so an
+// active writer still refuses.
+async function removeWin32Verified({file,sha,liveConfirmed}){
   if(liveConfirmed!==true)fail('Explicit confirmation required');
-  if(process.platform!=='win32')fail('Windows only');
+  if(!WIN32)fail('Windows only');
   rootPath(file);if(typeof sha!=='string'||!/^[0-9a-f]{64}$/.test(sha))fail('Invalid content hash');
-  const dir=path.dirname(file);await checkDir(dir);const entries=await fs.readdir(dir);if(entries.length!==1||entries[0]!==path.basename(file))fail('Refusing multiple generations or unexpected session-local artifacts');
+  const dir=path.dirname(file);await checkDir(dir);const entries=(await fs.readdir(dir)).filter(name=>name!==LOCK);if(entries.length!==1||entries[0]!==path.basename(file))fail('Refusing multiple generations or unexpected session-local artifacts');
   const actual=await digest(file);if(actual!==sha)fail('Log content changed since preview');
   const bytes=Number((await fs.stat(file)).size);
-  const lease='Local\\dsh-session-lock-'+hash(path.resolve(path.join(dir,'session.lock')).toLowerCase());
+  const lease='Local\\dsh-session-lock-'+hash(path.resolve(path.join(dir,LOCK)).toLowerCase());
   await runNative(nativeLive,{CLEANER_FILE:file,CLEANER_SHA:sha,CLEANER_LEASE:lease,CLEANER_PID:String(process.pid)});
   return {file,bytes};
 }
+async function removePosixVerified({file,sha,liveConfirmed}){
+  if(liveConfirmed!==true)fail('Explicit confirmation required');
+  if(WIN32)fail('POSIX only');
+  rootPath(file);if(typeof sha!=='string'||!/^[0-9a-f]{64}$/.test(sha))fail('Invalid content hash');
+  const dir=path.dirname(file);await checkDir(dir);
+  const lease=await acquireWriteLock(dir);
+  try{
+    const done=await removeUnderLock(file,sha);
+    await dropHusk(dir);
+    return {file,bytes:Number(done.size)};
+  }finally{await lease.release();}
+}
+async function removeVerified(options){return WIN32?removeWin32Verified(options):removePosixVerified(options);}
+module.exports={preparePlan,executePlan,inspectPlan:loadPlan,removeVerified,explain,composeNative,LOCK,
+  __posix:{acquireWriteLock,removeUnderLock,dropHusk,flockEntry,flockBinary,executePosixPlan,removePosixVerified}};

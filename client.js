@@ -10,7 +10,21 @@ window.__ModuleLoader__.load({
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body)
       });
-      return response.json();
+      const text = await response.text();
+      let data;
+      try {
+        data = JSON.parse(text);
+      } catch {
+        // The Host answers an unregistered route with a plain-text 404 (or 401 before
+        // authentication); report that instead of a raw JSON syntax error.
+        const hint = response.status === 404
+          ? '插件 Host 未载入（HTTP 404），请完全退出并重开 DSH 后再试'
+          : response.status === 401
+            ? '这次请求未通过 DSH 认证（HTTP 401），请刷新页面后重试'
+            : `插件接口返回了非 JSON 响应（HTTP ${response.status}）`;
+        throw Error(`${hint}：${clean(text).slice(0, 120) || '空响应'}`);
+      }
+      return data;
     };
     return {
       inject: ['contextMenus', 'workspaces', 'sessions', 'locale'],

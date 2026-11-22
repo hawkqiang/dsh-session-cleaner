@@ -8,9 +8,10 @@ import host from './host.cjs';
 export const inject=['workspaceRegistry','sessionPersistence','connection'];
 // Bump together with package.json. The startup line in host.log proves which
 // Host code the running DSH actually loaded.
-const VERSION='1.4.0';
+const VERSION='1.5.0';
+const PLATFORMS=new Set(['win32','linux','darwin','android']);
 export function apply(ctx){
-  if(process.platform!=='win32')return;
+  if(!PLATFORMS.has(process.platform))return;
   let stop,disposed=false,revision=0,guard,failed=false,planDir,logFile;
   // Diagnostics only: a rejection reason the page saw, so a failure can be explained
   // later without reproducing it. Never records chat content.
@@ -95,7 +96,8 @@ export function apply(ctx){
   ctx.effect(()=>{
     const startup=(async()=>{
       const base=await bridge.baseDir(),profile=process.env.DSH_PROFILE_DIR ? await fs.realpath(process.env.DSH_PROFILE_DIR) : base;
-      const key=createHash('sha256').update(profile.toLowerCase()).digest('hex');planDir=path.join(base,'plans-'+key);
+      const profileKey=process.platform==='win32'?profile.toLowerCase():profile;
+      const key=createHash('sha256').update(profileKey).digest('hex');planDir=path.join(base,'plans-'+key);
       logFile=path.join(base,'host.log');
       guard=path.join(base,'archive-epoch-'+key);await invalidate();if(disposed)return;
       await note(`host started v${VERSION} profile=${path.basename(profile)} pid=${process.pid}`);

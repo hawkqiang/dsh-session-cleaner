@@ -10,7 +10,23 @@ const path=require('node:path');
 const bridge=require('./bridge.cjs');
 const core=require('./core.cjs');
 const sid=/^[A-Za-z0-9_-]{1,160}$/;
-function clipboardId(){try{const t=execFileSync(path.join(process.env.SystemRoot,'System32','WindowsPowerShell','v1.0','powershell.exe'),['-NoProfile','-NonInteractive','-Command','Get-Clipboard -Raw'],{encoding:'utf8',timeout:5000,windowsHide:true}).trim();return sid.test(t)?t:'';}catch{return '';}}
+const SUPPORTED=new Set(['win32','linux','darwin','android']);
+function run(bin,args){try{return String(execFileSync(bin,args,{encoding:'utf8',timeout:5000,windowsHide:true})).trim()}catch{return ''}}
+// Windows reads the clipboard through PowerShell; Termux has its own clipboard
+// helper, and desktop POSIX falls back to the usual Wayland/X11/macOS tools.
+function clipboardId(){
+  let text='';
+  if(process.platform==='win32'){
+    text=run(path.join(process.env.SystemRoot,'System32','WindowsPowerShell','v1.0','powershell.exe'),['-NoProfile','-NonInteractive','-Command','Get-Clipboard -Raw']);
+  }else if(process.platform==='darwin'){
+    text=run('pbpaste',[]);
+  }else{
+    for(const [bin,args] of [['termux-clipboard-get',[]],['wl-paste',['-n']],['xclip',['-o','-selection','clipboard']],['xsel',['-ob']]]){
+      const out=run(bin,args);if(out){text=out;break}
+    }
+  }
+  return sid.test(text)?text:'';
+}
 async function planFor(id){
   const r=await bridge.request(id);
   if(!r.ok)throw Error(r.error||'DSH 拒绝了请求');
@@ -21,8 +37,8 @@ async function planFor(id){
   return {opts,p,f};
 }
 async function main(){
-  if(process.platform!=='win32')throw Error('仅支持 Windows');
-  if(process.versions.electron||!stdin.isTTY||!stdout.isTTY)throw Error('请在本机独立的 Windows 终端中启动助手。');
+  if(!SUPPORTED.has(process.platform))throw Error('仅支持 Windows、Linux、macOS 与 Termux');
+  if(process.versions.electron||!stdin.isTTY||!stdout.isTTY)throw Error('请在本机独立的终端中启动助手。');
   const rl=createInterface({input:stdin,output:stdout});
   try{
     const guess=clipboardId();

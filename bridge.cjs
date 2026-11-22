@@ -6,14 +6,28 @@ const { randomUUID } = require('node:crypto');
 const uuid = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/;
 const sid = /^[A-Za-z0-9_-]{1,160}$/;
 async function safeDir(d) {
-  if (path.resolve(d) !== d || !/^[A-Za-z]:\\/.test(d)) throw Error('需要本机绝对目录');
+  if (typeof d !== 'string' || !path.isAbsolute(d) || path.resolve(d) !== d) throw Error('需要本机绝对目录');
   for(let p=d;;p=path.dirname(p)) {const s=await fs.lstat(p); if(!s.isDirectory() || s.isSymbolicLink()) throw Error('不接受重定向目录'); if(p===path.dirname(p)) break;}
-  if((await fs.realpath(d)).toLowerCase() !== d.toLowerCase()) throw Error('目录位置不匹配');
+  const real=await fs.realpath(d);
+  if(process.platform==='win32'? real.toLowerCase()!==d.toLowerCase() : real!==d) throw Error('目录位置不匹配');
 }
+// Windows keeps its state under %LOCALAPPDATA%; POSIX (Linux, Android Termux, macOS)
+// follows the XDG state directory so the plugin works without any Windows shell.
 async function baseDir() {
-  if(process.platform !== 'win32' || !process.env.LOCALAPPDATA) throw Error('需要本机 Windows 用户目录');
-  const parent=process.env.LOCALAPPDATA; await safeDir(parent);
-  const base=path.join(parent,'DshSessionCleaner-v1'); await fs.mkdir(base,{mode:0o700}).catch(e=>{if(e.code!=='EEXIST')throw e;});await safeDir(base);return base;
+  let base;
+  if (process.platform === 'win32') {
+    const parent=process.env.LOCALAPPDATA;if(!parent)throw Error('需要本机 Windows 用户目录');
+    await safeDir(parent);
+    base=path.join(parent,'DshSessionCleaner-v1');
+  } else {
+    const home=process.env.HOME;
+    const state=process.env.XDG_STATE_HOME || (home ? path.join(home,'.local','state') : undefined);
+    if(!state)throw Error('需要本机用户目录');
+    base=path.join(state,'dsh-session-cleaner');
+  }
+  await fs.mkdir(base,{recursive:true,mode:0o700}).catch(e=>{if(e.code!=='EEXIST')throw e;});
+  await safeDir(base);
+  return base;
 }
 async function readMessage(file) {
   const s=await fs.lstat(file);if(!s.isFile()||s.isSymbolicLink()||s.nlink!==1||s.size>16384)throw Error('无效请求文件');
